@@ -28,6 +28,8 @@ import (
 
 	"github.com/tstams/kirla-api/internal/ablage"
 	"github.com/tstams/kirla-api/internal/geld"
+	"github.com/tstams/kirla-api/internal/kulanz"
+	"github.com/tstams/kirla-api/internal/nachbuch"
 	"github.com/tstams/kirla-api/internal/preise"
 	"github.com/tstams/kirla-api/internal/schluessel"
 	"github.com/tstams/kirla-api/internal/topf"
@@ -78,6 +80,20 @@ const (
 	vorgabeSchluesselDatei = "/srv/kirla-labs/dev/secrets/kirla-schluessel.json"
 	vorgabeHauptschluessel = "/srv/kirla-labs/dev/secrets/openrouter.env"
 )
+
+// kulanzFenster liest die Frist aus der Umgebung. Vorgabe sind die 24 Stunden aus
+// ADR-0016; einstellbar bleibt sie fuer den Betrieb und fuer die Probe.
+func kulanzFenster() time.Duration {
+	roh := os.Getenv("KIRLA_API_KULANZ")
+	if roh == "" {
+		return kulanz.VorgabeFenster
+	}
+	d, err := time.ParseDuration(roh)
+	if err != nil || d <= 0 {
+		return kulanz.VorgabeFenster
+	}
+	return d
+}
 
 func datenbankURL() (string, error) {
 	if u := os.Getenv("KIRLA_API_DATENBANK"); u != "" {
@@ -147,6 +163,24 @@ func dienst(protokoll *slog.Logger) error {
 	}
 	defer abl.Schliesse()
 
+	// ── DAS KULANZFENSTER (Schritt 3) ────────────────────────────────────────────────
+	//
+	// Faellt die Datenbank aus, altert der Stand im Arbeitsspeicher und der Vorbau
+	// antwortet weiter -- bis zu 24 Stunden (ADR-0016). Was in dieser Zeit an Abrechnung
+	// anfaellt, geht in eine Datei und wird nach der Wiederkehr nachgetragen.
+	lage := kulanz.Neu(kulanzFenster())
+	buchDatei := umgebung("KIRLA_API_NACHBUCH", "/srv/kirla-labs/nachbuch/offen.jsonl")
+	nb, err := nachbuch.Neu(buchDatei)
+	if err != nil {
+		return err
+	}
+	if wartend, err := nb.Anzahl(); err != nil {
+		protokoll.Warn("nachbuch nicht lesbar", "pfad", nb.Pfad(), "fehler", err)
+	} else if wartend > 0 {
+		protokoll.Warn("es liegt unbearbeitete abrechnung aus einem frueheren ausfall",
+			"saetze", wartend, "pfad", nb.Pfad())
+	}
+
 	toepfe := topf.Neu()
 	verzeichnis := &atomic.Pointer[schluessel.Verzeichnis]{}
 	verzeichnis.Store(schluessel.NeuesVerzeichnis(nil))
@@ -159,9 +193,23 @@ func dienst(protokoll *slog.Logger) error {
 		verzeichnis.Store(schluessel.NeuesVerzeichnis(eintraege))
 	}
 
+	nachtragen := func(c context.Context) {
+		getragen, err := nb.Arbeite(c, abl, 200)
+		if err != nil {
+			// Waehrend eines Ausfalls faellt das bei JEDEM Takt an -- der Abgleicher
+			// daempft seine eigene Meldung, und diese hier gehoert dazu. Warn statt
+			// Error: die Datei bleibt liegen, es geht nichts verloren.
+			protokoll.Warn("nachbuch noch nicht abgearbeitet — die datei bleibt liegen",
+				"getragen", getragen, "pfad", nb.Pfad())
+			return
+		}
+		if getragen > 0 {
+			protokoll.Info("nachbuch abgearbeitet", "saetze", getragen)
+		}
+	}
 	abgleicher := &ablage.Abgleicher{
-		Ablage: abl, Toepfe: toepfe, Protokoll: protokoll,
-		Takt: 30 * time.Second, Uebernimm: uebernimm,
+		Ablage: abl, Toepfe: toepfe, Protokoll: protokoll, Lage: lage,
+		Takt: 30 * time.Second, Uebernimm: uebernimm, NachDerWiederkehr: nachtragen,
 	}
 	// Der erste Abgleich MUSS gelingen: ohne Schluessel im Speicher wuerde der Dienst
 	// jeden Kunden abweisen, und das saehe aus wie ein Fehler beim Kunden.
@@ -185,8 +233,9 @@ func dienst(protokoll *slog.Logger) error {
 	// als eine Stunde Vorrat, falls die Datenbank haengt.
 	buch := make(chan ablage.Aufruf, 4096)
 	schreiber := &ablage.Schreiber{
-		Ablage: abl, Toepfe: toepfe, Eingang: buch, Protokoll: protokoll,
-		Stapel: 64, Takt: 2 * time.Second,
+		Ablage: abl, Toepfe: toepfe, Eingang: buch, Protokoll: protokoll, Lage: lage,
+		Notfall: nb.Schreibe,
+		Stapel:  64, Takt: 2 * time.Second,
 	}
 	fertig := make(chan struct{})
 	go func() { schreiber.Laufe(ctx); close(fertig) }()
@@ -201,6 +250,7 @@ func dienst(protokoll *slog.Logger) error {
 		Buch:            buch,
 		Aufschlag:       aufschlag,
 		Boden:           boden,
+		Lage:            lage,
 	}
 	// Das Verzeichnis wird vom Abgleicher ausgetauscht; der Vorbau liest es je Anfrage.
 	v.Verzeichnis = verzeichnis.Load()

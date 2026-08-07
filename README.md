@@ -23,7 +23,7 @@ sie genauso zurück; wer hier normalisiert, bricht die Namensbrücke im Adapter.
 |---|---|---|
 | 1 | Durchreichen + Schlüsselprüfung | **gebaut** |
 | 2 | Kopfdaten buchen, Guthabentöpfe, `402` | **gebaut** |
-| 3 | Kulanzfenster 24 h | offen |
+| 3 | Kulanzfenster 24 h | **gebaut** |
 | 4 | Ablage 30 Tage komprimiert + `GET /v1/route` | offen |
 | 5 | Stripe-Aufladung | offen |
 

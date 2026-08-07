@@ -27,6 +27,7 @@ import (
 	"github.com/tstams/kirla-api/internal/ablage"
 	"github.com/tstams/kirla-api/internal/geld"
 	"github.com/tstams/kirla-api/internal/kosten"
+	"github.com/tstams/kirla-api/internal/kulanz"
 	"github.com/tstams/kirla-api/internal/preise"
 	"github.com/tstams/kirla-api/internal/schluessel"
 	"github.com/tstams/kirla-api/internal/topf"
@@ -60,6 +61,9 @@ type Vorbau struct {
 	// Boden wird gebucht, wenn OpenRouter keine Kosten meldet (Auftrag §4: "wird ein
 	// Boden gebucht und nicht null").
 	Boden geld.Betrag
+	// Lage sagt, ob die Datenbank antwortet, wie lange sie schon weg ist und ob das
+	// Kulanzfenster noch traegt (Schritt 3). Ist sie nil, gilt alles als gesund.
+	Lage *kulanz.Lage
 }
 
 // hopfenweise sind die Kopfzeilen, die nur fuer EINE Verbindung gelten und deshalb nicht
@@ -198,9 +202,32 @@ func (v *Vorbau) durchreichen(w http.ResponseWriter, r *http.Request, e schluess
 	// laeuft ALLES weiter durch. Gepuffert wird er nicht (Auftrag §3).
 	sicht, koerper := spaehe(r.Body)
 
+	// ── DAS KULANZFENSTER ENTSCHEIDET, OB UEBERHAUPT ZURUECKGELEGT WIRD ───────────────
+	//
+	// Auftrag §4: "Waehrend des Kulanzfensters (Datenbank weg) wird nicht zurueckgelegt,
+	// sondern nur mitgeschrieben." Der Grund steht in §0: die Toepfe im Speicher sind
+	// dann veraltet, und auf einen veralteten Stand hin einen 402 zu schicken hiesse,
+	// einer Kundenfirma den Modellzugang zu nehmen, weil UNSERE Datenbank weg ist.
+	//
+	// Nach 24 Stunden ist Schluss. Das ist der bewusst gezahlte Preis aus ADR-0016 --
+	// "wer kirla.ai 24 Stunden blockiert, arbeitet 24 Stunden ohne Autorisierung" --
+	// und nicht mehr.
+	zustand := kulanz.Gesund
+	var alter time.Duration
+	if v.Lage != nil {
+		zustand, alter = v.Lage.Zustand()
+	}
+	if zustand == kulanz.Abgelaufen {
+		v.Protokoll.Error("kulanzfenster abgelaufen — es wird nichts mehr weitergereicht",
+			"anfrage_id", anfrageID, "nutzer", e.Nutzer, "alter_stunden", alter.Hours())
+		v.fehler(w, http.StatusServiceUnavailable, "kirla_kulanz_abgelaufen",
+			"kirla.ai kommt seit ueber 24 Stunden nicht an seine Abrechnung. Der Zugang ruht, bis das behoben ist — bitte beim Betreiber melden.", anfrageID)
+		return
+	}
+
 	// ── ZURUECKLEGEN, bevor bei OpenRouter Kosten entstehen (Auftrag §4) ──────────────
 	var quittung *topf.Quittung
-	if v.Toepfe != nil {
+	if v.Toepfe != nil && zustand == kulanz.Gesund {
 		var err error
 		quittung, err = v.legeZurueck(e, sicht, r.ContentLength)
 		if err != nil {

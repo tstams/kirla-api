@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/tstams/kirla-api/internal/geld"
+	"github.com/tstams/kirla-api/internal/kulanz"
 	"github.com/tstams/kirla-api/internal/topf"
 )
 
@@ -19,6 +20,12 @@ type Schreiber struct {
 	Toepfe    *topf.Toepfe
 	Eingang   <-chan Aufruf
 	Protokoll *slog.Logger
+	Lage      *kulanz.Lage
+
+	// Notfall faengt auf, was nicht in die Datenbank kann (Auftrag §4: "nur
+	// mitgeschrieben — in eine Datei, die nach der Wiederkehr abgearbeitet wird").
+	// Fehlt er, geht die Abrechnung verloren und es steht laut im Protokoll.
+	Notfall func([]Aufruf) error
 
 	// Stapel ist, wie viele Saetze hoechstens auf einmal geschrieben werden.
 	Stapel int
@@ -75,16 +82,30 @@ func (s *Schreiber) schreibe(ctx context.Context, stapel []Aufruf) {
 	defer abbrechen()
 
 	if err := s.Ablage.SchreibeAufrufe(frist, stapel); err != nil {
-		// HIER GEHT ABRECHNUNG VERLOREN, und das muss laut im Protokoll stehen.
-		// Ab Schritt 3 faengt eine Datei diese Saetze auf und arbeitet sie nach der
-		// Wiederkehr ab (Auftrag §4, Kulanzfenster).
+		if s.Lage != nil {
+			s.Lage.Gescheitert()
+		}
 		var summe geld.Betrag
 		for _, a := range stapel {
 			summe += a.Verkauf
 		}
-		s.Protokoll.Error("kopfdaten nicht geschrieben — abrechnung fehlt",
+		// DIE DATEI IST DIE EINZIGE SPUR, solange die Datenbank weg ist.
+		if s.Notfall != nil {
+			if notErr := s.Notfall(stapel); notErr == nil {
+				s.Protokoll.Warn("datenbank weg — kopfdaten ins nachbuch",
+					"saetze", len(stapel), "summe_usd", summe.Text(6), "fehler", err)
+				return
+			} else {
+				s.Protokoll.Error("nachbuch nicht schreibbar", "fehler", notErr)
+			}
+		}
+		// Weder Datenbank noch Nachbuch: JETZT ist Abrechnung wirklich weg.
+		s.Protokoll.Error("kopfdaten nicht geschrieben — ABRECHNUNG VERLOREN",
 			"saetze", len(stapel), "summe_usd", summe.Text(6), "fehler", err)
 		return
+	}
+	if s.Lage != nil {
+		s.Lage.Gelungen()
 	}
 
 	// Erst NACH dem erfolgreichen Schreiben darf der Verbrauch aus den Toepfen im
@@ -109,8 +130,17 @@ type Abgleicher struct {
 	Toepfe    *topf.Toepfe
 	Protokoll *slog.Logger
 	Takt      time.Duration
+	Lage      *kulanz.Lage
 	// Uebernimm bekommt die frisch geladenen Schluessel.
 	Uebernimm func([]SchluesselMitTopf)
+	// NachDerWiederkehr laeuft, wenn ein Abgleich nach einem Ausfall wieder gelingt --
+	// dort wird das Nachbuch abgearbeitet.
+	NachDerWiederkehr func(context.Context)
+
+	// Zaehler fuer die Daempfung der Protokollzeilen waehrend eines Ausfalls. Nur aus
+	// Einmal() heraus benutzt, und das laeuft in genau einem Faden.
+	stille             int
+	abgelaufenGemeldet bool
 }
 
 func (a *Abgleicher) Laufe(ctx context.Context) {
@@ -135,15 +165,64 @@ func (a *Abgleicher) Einmal(ctx context.Context) {
 	frist, abbrechen := context.WithTimeout(ctx, 15*time.Second)
 	defer abbrechen()
 
+	// ── ERST NACHBUCHEN, DANN DEN STAND HOLEN ────────────────────────────────────────
+	//
+	// Das Nachbuch traegt seine Abbuchungen in die Datenbank ein. Wer zuerst den Stand
+	// holt und danach nachbucht, hat im Speicher genau den Stand VON VORHER -- die Toepfe
+	// waeren fuer einen Takt zu grosszuegig. Andersherum stimmt es sofort.
+	//
+	// Ist die Datenbank noch weg, scheitert das Nachbuchen still und die Datei bleibt
+	// liegen. Genau dafuer ist sie da.
+	if a.Lage != nil && a.NachDerWiederkehr != nil {
+		if z, _ := a.Lage.Zustand(); z != kulanz.Gesund {
+			a.NachDerWiederkehr(ctx)
+		}
+	}
+
 	liste, err := a.Ablage.LadeSchluessel(frist)
 	if err != nil {
-		a.Protokoll.Error("abgleich gescheitert — der stand im speicher altert weiter", "fehler", err)
+		if a.Lage == nil {
+			a.Protokoll.Error("abgleich gescheitert — der stand im speicher altert weiter", "fehler", err)
+			return
+		}
+		a.Lage.Gescheitert()
+		z, alter := a.Lage.Zustand()
+
+		// ── NICHT BEI JEDEM TAKT SCHREIEN ────────────────────────────────────────────
+		//
+		// Der Abgleich laeuft alle 30 Sekunden. Ein Ausfall ueber das volle Fenster
+		// ergaebe 2880 ERROR-Zeilen, jede mit dem vollstaendigen Verbindungsfehler --
+		// auf einem Host, dessen kirla-ops-alert-Units auf Fehler schauen, deckt das
+		// jeden anderen Befund zu. Der erste Ausfall ist laut, danach alle fuenf
+		// Minuten eine Zeile, und beim Uebergang ins Abgelaufene wieder laut.
+		a.stille++
+		laut := a.stille == 1 || a.stille%10 == 0 || (z == kulanz.Abgelaufen && !a.abgelaufenGemeldet)
+		if z == kulanz.Abgelaufen {
+			a.abgelaufenGemeldet = true
+		}
+		if laut {
+			stufe := slog.LevelWarn
+			if z == kulanz.Abgelaufen {
+				stufe = slog.LevelError
+			}
+			a.Protokoll.Log(ctx, stufe, "abgleich gescheitert — der stand im speicher altert weiter",
+				"zustand", z.String(), "alter_minuten", int(alter.Minutes()),
+				"rest_stunden", a.Lage.Rest().Hours(), "versuche", a.stille, "fehler", err)
+		}
 		return
+	}
+	if a.stille > 0 {
+		a.Protokoll.Info("datenbank wieder da", "gescheiterte_versuche", a.stille)
+		a.stille = 0
+		a.abgelaufenGemeldet = false
 	}
 	for _, s := range liste {
 		a.Toepfe.Setze(s.Eintrag.Kennung, s.Guthaben)
 	}
 	if a.Uebernimm != nil {
 		a.Uebernimm(liste)
+	}
+	if a.Lage != nil {
+		a.Lage.Gelungen()
 	}
 }

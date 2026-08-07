@@ -31,6 +31,8 @@ Environment=KIRLA_API_ADRESSE=127.0.0.1:3303
 Environment=KIRLA_API_ZIEL=https://openrouter.ai/api/v1
 Environment=KIRLA_API_SCHLUESSEL=/srv/kirla-labs/dev/secrets/kirla-schluessel.json
 Environment=KIRLA_API_HAUPTSCHLUESSEL=/srv/kirla-labs/dev/secrets/openrouter.env
+# Das Nachbuch faengt Abrechnung auf, solange die Datenbank weg ist (Kulanzfenster).
+Environment=KIRLA_API_NACHBUCH=/srv/kirla-labs/nachbuch/offen.jsonl
 
 Restart=always
 RestartSec=2s
@@ -41,10 +43,12 @@ TimeoutStopSec=120s
 KillSignal=SIGTERM
 
 # ── Rechte enger, als sie sein muessten ────────────────────────────────────────────────
-# Schritt 1 liest nur: das Binary, die zwei Schluesseldateien, das Netz. Sobald Schritt 2
-# in eine Datenbank schreibt, kommt hier ein ReadWritePaths dazu -- und nicht eher.
+# Gelesen wird: das Binary, die Schluesseldateien, die Datenbankzugangsdaten, das Netz.
+# GESCHRIEBEN WIRD GENAU AN EINER STELLE: das Nachbuch. Alles andere geht in die Datenbank,
+# und die ist ein Netzdienst, kein Dateisystem.
 NoNewPrivileges=yes
 ProtectSystem=strict
+ReadWritePaths=/srv/kirla-labs/nachbuch
 ProtectHome=yes
 PrivateTmp=yes
 PrivateDevices=yes
