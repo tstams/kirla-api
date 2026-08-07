@@ -60,6 +60,29 @@ func (v *Vorbau) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// ── /v1/key DARF NIEMALS DURCHGEREICHT WERDEN ──────────────────────────────────────
+	//
+	// Gefunden am 07.08.2026 beim Umstellen der ersten Instanz. klabs ruft diesen Endpunkt
+	// aus `llm-budget`, um den anbieterseitigen Ausgabendeckel zu pruefen -- die Bedingung,
+	// an der seine ganze Autonomie haengt ("Autonomie nur gegen einen verifizierten
+	// anbieterseitigen Ausgabendeckel").
+	//
+	// Durchgereicht bekaeme OpenRouter den HAUPTSCHLUESSEL zu sehen und antwortete mit dem
+	// Zustand des BETREIBERKONTOS: dessen Verbrauch, dessen Limit, dessen Restguthaben.
+	// Zwei Schaeden auf einmal -- der Kunde saehe die Zahlen aller anderen Kunden, und
+	// klabs hielte das gesamte Betreiberkonto fuer sein eigenes Limit und liefe autonom
+	// gegen eine Grenze, die ihm nicht gehoert.
+	//
+	// Ab Schritt 2 antwortet dieser Endpunkt mit dem GUTHABENTOPF DIESES SCHLUESSELS, in
+	// der Form, die OpenRouter liefert. Dann erfuellt kirla.ai die Bedingung von klabs
+	// unveraendert und ohne eine Zeile Aenderung auf der Kundenseite. Bis dahin: eine
+	// ehrliche Absage statt einer fremden Zahl.
+	if r.URL.Path == "/v1/key" {
+		v.fehler(w, r, http.StatusNotImplemented, "kirla_guthaben_noch_nicht_da",
+			"Das Guthaben je Schluessel gibt es noch nicht; bis dahin kann kirla.ai keinen Ausgabendeckel ausweisen. Der Deckel des Betreiberkontos wird bewusst NICHT gemeldet.", anfrageID)
+		return
+	}
+
 	if !strings.HasPrefix(r.URL.Path, "/v1/") {
 		v.fehler(w, r, http.StatusNotFound, "kirla_unbekannter_pfad",
 			"Diesen Pfad gibt es hier nicht. kirla.ai spricht die OpenAI-Schnittstelle unter /v1/.", anfrageID)

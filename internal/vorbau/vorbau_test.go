@@ -318,27 +318,53 @@ func TestDerVorbauErfindetKeineInhaltskodierung(t *testing.T) {
 	}
 }
 
-// GET /v1/route GEHOERT UNS. Bis Schritt 4 gebaut ist, darf es nicht an OpenRouter gehen —
-// der Kunde bekaeme sonst ein 404 aus einem fremden Haus.
-func TestRouteGehtNichtAnOpenRouter(t *testing.T) {
-	gefragt := false
-	vor, key := bau(t, func(w http.ResponseWriter, r *http.Request) {
-		gefragt = true
-	})
+// UNSERE EIGENEN PFADE GEHEN NICHT AN OPENROUTER.
+//
+// /v1/route ist die Auskunft ueber die Ablage (Auftrag §5) und kommt mit Schritt 4.
+//
+// /v1/key ist der ernstere Fall und der Grund, warum dieser Test existiert: klabs ruft ihn
+// aus `llm-budget`, um den anbieterseitigen Ausgabendeckel zu pruefen. Durchgereicht saehe
+// OpenRouter den HAUPTSCHLUESSEL und antwortete mit dem Zustand des BETREIBERKONTOS --
+// Verbrauch, Limit und Rest ALLER Kunden zusammen. Der Kunde bekaeme fremde Zahlen zu
+// sehen, und klabs hielte das ganze Betreiberkonto fuer sein eigenes Limit.
+func TestUnserePfadeGehenNichtAnOpenRouter(t *testing.T) {
+	for _, fall := range []struct{ pfad, kennung string }{
+		{"/v1/route", "kirla_route_noch_nicht_da"},
+		{"/v1/key", "kirla_guthaben_noch_nicht_da"},
+	} {
+		t.Run(fall.pfad, func(t *testing.T) {
+			gefragt := false
+			vor, key := bau(t, func(w http.ResponseWriter, r *http.Request) {
+				gefragt = true
+				// Genau die Gestalt, die OpenRouter fuer das Betreiberkonto liefert.
+				_, _ = io.WriteString(w, `{"data":{"label":"betreiberkonto","usage":842.17,"limit":2000,"limit_remaining":1157.83}}`)
+			})
 
-	r, _ := http.NewRequest(http.MethodGet, vor.URL+"/v1/route", nil)
-	r.Header.Set("Authorization", "Bearer "+key)
-	antw, err := http.DefaultClient.Do(r)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer antw.Body.Close()
+			r, _ := http.NewRequest(http.MethodGet, vor.URL+fall.pfad, nil)
+			r.Header.Set("Authorization", "Bearer "+key)
+			antw, err := http.DefaultClient.Do(r)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer antw.Body.Close()
+			gelesen, _ := io.ReadAll(antw.Body)
 
-	if gefragt {
-		t.Fatal("/v1/route wurde an OpenRouter weitergereicht")
-	}
-	if antw.StatusCode != http.StatusNotImplemented {
-		t.Errorf("Status %d statt 501", antw.StatusCode)
+			if gefragt {
+				t.Fatalf("%s wurde an OpenRouter weitergereicht", fall.pfad)
+			}
+			if antw.StatusCode != http.StatusNotImplemented {
+				t.Errorf("Status %d statt 501", antw.StatusCode)
+			}
+			if !strings.Contains(string(gelesen), fall.kennung) {
+				t.Errorf("falsche Fehlerkennung: %s", gelesen)
+			}
+			// Der Beweis, auf den es ankommt: keine fremde Zahl im Koerper.
+			for _, verraeter := range []string{"842.17", "2000", "1157.83", "betreiberkonto"} {
+				if strings.Contains(string(gelesen), verraeter) {
+					t.Fatalf("ZAHLEN DES BETREIBERKONTOS SIND DURCHGEDRUNGEN (%q): %s", verraeter, gelesen)
+				}
+			}
+		})
 	}
 }
 
