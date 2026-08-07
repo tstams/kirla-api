@@ -13,9 +13,11 @@ package kosten
 
 import (
 	"bytes"
+	"compress/gzip"
 	"encoding/json"
 	"io"
 	"strings"
+	"sync"
 
 	"github.com/tstams/kirla-api/internal/geld"
 )
@@ -44,11 +46,28 @@ type Verbrauch struct {
 // Der Schwanz genuegt: sowohl bei JSON als auch bei text/event-stream steht `usage` am
 // Ende. Eine unbegrenzte Kopie waere der Fehler -- sie haenge den Speicher an die Laenge
 // der Antwort, und genau das soll der Vorbau nicht.
+//
+// ── GEPACKTE ANTWORTEN ──────────────────────────────────────────────────────────────────
+//
+// Gefunden am 07.08.2026 im Betrieb, nachdem jeder klabs-Aufruf den Boden gebucht hatte
+// statt seiner echten Kosten -- ein 400-facher Aufschlag. Der Grund: Gos http.Transport
+// setzt von sich aus `Accept-Encoding: gzip`, wenn der Aufrufer den Kopf nicht selbst
+// setzt. Der Vorbau reicht ihn unveraendert weiter (das MUSS er), OpenRouter antwortet
+// gepackt -- und aus gepackten Bytes laesst sich kein `usage` lesen.
+//
+// Entpackt wird deshalb eine KOPIE, waehrend die Originalbytes unveraendert
+// weiterlaufen. Das ist die einzige Loesung, die beide Zusagen haelt.
 type Mitleser struct {
 	ziel   io.Writer
 	puffer []byte
 	max    int
 	Gesamt int64
+
+	// Fuer gepackte Antworten: die Kopie laeuft durch eine Roehre in einen Entpacker.
+	rohrEin  *io.PipeWriter
+	fertig   chan struct{}
+	mu       sync.Mutex
+	entpackt bool
 }
 
 // NeuerMitleser schreibt nach ziel und behaelt hoechstens max Bytes vom Ende.
@@ -59,25 +78,79 @@ func NeuerMitleser(ziel io.Writer, max int) *Mitleser {
 	return &Mitleser{ziel: ziel, max: max}
 }
 
+// Entpacke schaltet das Entpacken des Schwanzes ein. `kodierung` ist der Wert der
+// Kopfzeile Content-Encoding; alles ausser gzip laesst den Mitleser unveraendert.
+func (m *Mitleser) Entpacke(kodierung string) *Mitleser {
+	if !strings.EqualFold(strings.TrimSpace(kodierung), "gzip") {
+		return m
+	}
+	lesen, schreiben := io.Pipe()
+	m.rohrEin = schreiben
+	m.fertig = make(chan struct{})
+	m.entpackt = true
+	go func() {
+		defer close(m.fertig)
+		// Was hier schiefgeht, kostet nur die Kostenzahl -- der Kunde bekommt seine
+		// Antwort in jedem Fall. Deshalb wird der Rest immer leergelesen.
+		defer io.Copy(io.Discard, lesen)
+
+		aus, err := gzip.NewReader(lesen)
+		if err != nil {
+			return
+		}
+		defer aus.Close()
+		puffer := make([]byte, 32*1024)
+		for {
+			n, leseFehler := aus.Read(puffer)
+			if n > 0 {
+				m.anhaengen(puffer[:n])
+			}
+			if leseFehler != nil {
+				return
+			}
+		}
+	}()
+	return m
+}
+
+func (m *Mitleser) anhaengen(p []byte) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.puffer = append(m.puffer, p...)
+	if len(m.puffer) > m.max {
+		behalten := m.puffer[len(m.puffer)-m.max:]
+		m.puffer = append(m.puffer[:0], behalten...)
+	}
+}
+
 func (m *Mitleser) Write(p []byte) (int, error) {
 	// ZUERST weiterschreiben. Ein Fehler beim Mitlesen darf den Kunden nichts kosten;
 	// ein Fehler beim Schreiben beendet beides.
 	n, err := m.ziel.Write(p)
 	if n > 0 {
 		m.Gesamt += int64(n)
-		m.puffer = append(m.puffer, p[:n]...)
-		if len(m.puffer) > m.max {
-			// Nur den Schwanz behalten. copy statt slice, damit der grosse
-			// Ausgangspuffer freigegeben werden kann.
-			behalten := m.puffer[len(m.puffer)-m.max:]
-			m.puffer = append(m.puffer[:0], behalten...)
+		if m.entpackt {
+			// Die Kopie geht in den Entpacker; ein Fehler dort beendet nur das
+			// Mitlesen.
+			_, _ = m.rohrEin.Write(p[:n])
+		} else {
+			m.anhaengen(p[:n])
 		}
 	}
 	return n, err
 }
 
-// Schwanz gibt die behaltenen Bytes.
-func (m *Mitleser) Schwanz() []byte { return m.puffer }
+// Schwanz gibt die behaltenen Bytes. Bei gepackten Antworten wird zuvor auf den Entpacker
+// gewartet -- sonst laese man einen halb gefuellten Puffer.
+func (m *Mitleser) Schwanz() []byte {
+	if m.entpackt {
+		_ = m.rohrEin.Close()
+		<-m.fertig
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.puffer
+}
 
 // huelle ist der Ausschnitt einer OpenRouter-Antwort, auf den es hier ankommt.
 type huelle struct {
@@ -168,4 +241,27 @@ func ausHuelle(h huelle) Verbrauch {
 // IstStrom sagt, ob die Antwort ein text/event-stream ist.
 func IstStrom(inhaltstyp string) bool {
 	return strings.HasPrefix(strings.TrimSpace(strings.ToLower(inhaltstyp)), "text/event-stream")
+}
+
+// Entpacke gibt die entpackten Bytes zurueck, wenn die Kodierung gzip ist -- sonst die
+// Bytes, wie sie kamen. Fuer den nicht stroemenden Weg, wo die Antwort ohnehin vollstaendig
+// vorliegt.
+//
+// Schlaegt das Entpacken fehl, kommen die Originalbytes zurueck. Sie sind dann zwar nicht
+// lesbar, aber der Aufrufer bucht daraufhin den Boden -- und das ist die sichere Richtung.
+func Entpacke(roh []byte, kodierung string) []byte {
+	if !strings.EqualFold(strings.TrimSpace(kodierung), "gzip") {
+		return roh
+	}
+	aus, err := gzip.NewReader(bytes.NewReader(roh))
+	if err != nil {
+		return roh
+	}
+	defer aus.Close()
+	// Begrenzt: eine Zip-Bombe soll den Vorbau nicht umbringen.
+	entpackt, err := io.ReadAll(io.LimitReader(aus, 32<<20))
+	if err != nil && len(entpackt) == 0 {
+		return roh
+	}
+	return entpackt
 }

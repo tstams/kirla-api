@@ -281,7 +281,10 @@ func (v *Vorbau) durchreichen(w http.ResponseWriter, r *http.Request, e schluess
 			return
 		}
 		if int64(len(roh)) <= grenzeOhneStrom {
-			verbrauch := kosten.Lies(roh, false)
+			// Gepackte Antworten: eine ENTPACKTE KOPIE auswerten, die Originalbytes
+			// gehen unveraendert hinaus. Ohne das bucht jeder Aufruf den Boden --
+			// gefunden im Betrieb am 07.08.2026, siehe internal/kosten.
+			verbrauch := kosten.Lies(kosten.Entpacke(roh, antw.Header.Get("Content-Encoding")), false)
 			einkauf, quelle := v.einkauf(verbrauch, antw.StatusCode)
 			verkauf := einkauf.MitAufschlag(v.Aufschlag)
 			if v.Toepfe != nil {
@@ -306,7 +309,7 @@ func (v *Vorbau) durchreichen(w http.ResponseWriter, r *http.Request, e schluess
 
 	// Der Mitleser reicht jedes Byte unveraendert weiter und behaelt nur den Schwanz,
 	// um daraus `usage` zu lesen.
-	mit := kosten.NeuerMitleser(w, schwanzGrenze)
+	mit := kosten.NeuerMitleser(w, schwanzGrenze).Entpacke(antw.Header.Get("Content-Encoding"))
 	stroeme(w, mit, quelleKoerper)
 
 	// ── ABRECHNEN mit dem, was wirklich angefallen ist (Auftrag §4) ───────────────────

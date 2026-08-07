@@ -2,6 +2,7 @@ package kosten
 
 import (
 	"bytes"
+	"compress/gzip"
 	"strings"
 	"testing"
 
@@ -153,5 +154,68 @@ func TestIstStrom(t *testing.T) {
 		if got := IstStrom(f.typ); got != f.ja {
 			t.Errorf("IstStrom(%q) = %v", f.typ, got)
 		}
+	}
+}
+
+// ── DER FEHLER, DER JEDEN KLABS-AUFRUF UM DAS 400-FACHE VERTEUERT HAT ──────────────────
+//
+// Gefunden im Betrieb am 07.08.2026: jeder Aufruf von leuchtfeuer buchte den Boden (0,023 $)
+// statt seiner echten Kosten (0,00005 $). Gos http.Transport setzt von sich aus
+// `Accept-Encoding: gzip`, wenn der Aufrufer den Kopf nicht selbst setzt. Der Vorbau reicht
+// ihn unveraendert weiter -- das MUSS er --, OpenRouter antwortet gepackt, und aus gepackten
+// Bytes laesst sich kein usage lesen.
+func TestGepackteAntwortenWerdenTrotzdemAbgerechnet(t *testing.T) {
+	const klartext = `{"model":"m","usage":{"prompt_tokens":9,"completion_tokens":40,"cost":0.000054077}}`
+	var gepackt bytes.Buffer
+	packer := gzip.NewWriter(&gepackt)
+	if _, err := packer.Write([]byte(klartext)); err != nil {
+		t.Fatal(err)
+	}
+	if err := packer.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Run("ganze Antwort", func(t *testing.T) {
+		v := Lies(Entpacke(gepackt.Bytes(), "gzip"), false)
+		if v.Quelle != Gemeldet {
+			t.Fatalf("Quelle %q statt gemeldet — der Boden wurde gebucht", v.Quelle)
+		}
+		if v.Einkauf != geld.Betrag(54_077) {
+			t.Errorf("Einkauf %d Nano statt 54077", int64(v.Einkauf))
+		}
+	})
+
+	t.Run("durch den Mitleser", func(t *testing.T) {
+		var raus bytes.Buffer
+		m := NeuerMitleser(&raus, 64*1024).Entpacke("gzip")
+		// Stueckweise, wie ein Strom es taete.
+		roh := gepackt.Bytes()
+		for i := 0; i < len(roh); i += 5 {
+			ende := min(i+5, len(roh))
+			if _, err := m.Write(roh[i:ende]); err != nil {
+				t.Fatal(err)
+			}
+		}
+		// DIE DURCHGEREICHTEN BYTES BLEIBEN GEPACKT UND UNVERAENDERT.
+		if !bytes.Equal(raus.Bytes(), roh) {
+			t.Fatal("der Mitleser hat die durchgereichten Bytes veraendert")
+		}
+		// Der Schwanz ist entpackt und lesbar.
+		v := Lies(m.Schwanz(), false)
+		if v.Quelle != Gemeldet {
+			t.Fatalf("Quelle %q statt gemeldet", v.Quelle)
+		}
+		if v.Einkauf != geld.Betrag(54_077) {
+			t.Errorf("Einkauf %d Nano statt 54077", int64(v.Einkauf))
+		}
+	})
+}
+
+// KAPUTTE PACKUNG DARF NICHT ZUM ABSTURZ FUEHREN -- sie fuehrt zum Boden, und das ist die
+// sichere Richtung.
+func TestKaputteVerpackungFuehrtZumBoden(t *testing.T) {
+	v := Lies(Entpacke([]byte("das ist kein gzip"), "gzip"), false)
+	if v.Quelle != Boden {
+		t.Errorf("Quelle %q statt boden", v.Quelle)
 	}
 }
