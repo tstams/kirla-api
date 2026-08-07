@@ -45,7 +45,7 @@ Einstellungen über die Umgebung:
 
 | Name | Vorgabe | Wofür |
 |---|---|---|
-| `KIRLA_API_ADRESSE` | `127.0.0.1:8080` | worauf gelauscht wird |
+| `KIRLA_API_ADRESSE` | `127.0.0.1:3303` | worauf gelauscht wird (Bereich 3303–3349 laut REGISTRY.md; 8080 ist gesperrt) |
 | `KIRLA_API_ZIEL` | `https://openrouter.ai/api/v1` | wohin weitergereicht wird |
 | `KIRLA_API_SCHLUESSEL` | `/srv/kirla-labs/dev/secrets/kirla-schluessel.json` | die vergebenen Kundenschlüssel (nur Hashes) |
 | `KIRLA_API_HAUPTSCHLUESSEL` | `/srv/kirla-labs/dev/secrets/openrouter.env` | der OpenRouter-Hauptschlüssel, Modus 0600 |
@@ -55,12 +55,21 @@ Schlüsseltausch braucht keinen Neustart.
 
 ## Prüfen ohne Kunden
 
-klabs zeigt über `CEO_LLM_BASE_URL` hierher:
+klabs zeigt über `CEO_LLM_BASE_URL` hierher. **Zwei Fallen, beide gemessen:**
+
+* Die Basis-URL steht **ohne `/v1`** — klabs hängt `/v1/chat/completions` selbst an
+  (`core/openrouter/openrouter.go:299`). Mit `/v1` entsteht `/v1/v1/…` und ein 404, der wie
+  ein Fehler der Zwischenstelle aussieht.
+* Der Schlüssel steht in **`OPENROUTER_API_KEY`**, nicht in `CEO_LLM_API_KEY` — auch wenn ein
+  `kirla_sk_…` drin liegt (`core/cmd/klabs/agent.go`, `schluesselHolen`). klabs liest zuerst
+  die Umgebung, dann `$HOME/dev/secrets/openrouter.env`. `CEO_LLM_BASE_URL` dagegen kommt
+  **nur** aus der Umgebung — wer nur die Datei ändert und von Hand startet, landet weiter bei
+  OpenRouter.
 
 ```bash
-CEO_LLM_BASE_URL=http://localhost:8080/v1 \
-CEO_LLM_API_KEY=kirla_sk_… \
-klabs lead --instance <testinstanz>
+CEO_LLM_BASE_URL=https://api.kirla.ai \
+OPENROUTER_API_KEY=kirla_sk_… \
+klabs lead
 ```
 
 Die Testdaten stammen aus `core/openrouter/openrouter_test.go` in klabs — aus echten Fehlern,

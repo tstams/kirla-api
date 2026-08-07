@@ -1,0 +1,20 @@
+[Unit]
+Description=Kirla Labs — die kirla.ai-Zwischenstelle (eigener Deckel unter kirla-labs)
+# Kind von kirla-labs.slice (systemd leitet die Eltern aus dem Namen ab). Damit gilt der
+# 6-G-Deckel von Labs zusaetzlich; dieser hier ist der engere.
+Before=kirla-api.service
+
+[Slice]
+# Gemessen braucht der Dienst im Leerlauf 3,2 MB. Auch bei den 20-30 gleichzeitigen
+# Stroemen aus dem Bauauftrag §6 bleibt er weit darunter -- er puffert nichts, sondern
+# reicht 8-KB-Stuecke durch. 512 M sind reichlich und trotzdem eine echte Grenze: laeuft
+# er je darueber, ist das ein Fehler und kein Wachstum.
+MemoryHigh=256M
+MemoryMax=512M
+MemorySwapMax=0
+# Ein einzelner Go-Prozess, der fast nur wartet. Zwei Kerne reichen mit Abstand.
+CPUQuota=200%
+IOWeight=20
+TasksMax=512
+ManagedOOMMemoryPressure=kill
+ManagedOOMMemoryPressureLimit=60%

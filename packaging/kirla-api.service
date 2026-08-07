@@ -13,11 +13,21 @@ Type=exec
 User=labs
 Group=labs
 
+# Eigene Slice mit MemoryMax -- Pflicht nach /etc/kirla/REGISTRY.md §0.6: "Kein neuer
+# Dienst auf diesem Host ohne (a) Zeile in dieser Registry, (b) eigenen Systembenutzer,
+# (c) eigene Slice mit MemoryMax, (d) Port aus dem reservierten Bereich, (e) Eintrag, ob
+# er ins Backup gehoert."
+Slice=kirla-labs-api.slice
+
 ExecStart=/usr/local/bin/kirla-api dienst
 # SIGHUP laedt Hauptschluessel und Schluesselablage neu, ohne den Dienst anzuhalten.
 ExecReload=/bin/kill -HUP $MAINPID
 
-Environment=KIRLA_API_ADRESSE=127.0.0.1:8080
+# Port 3303 aus dem fuer Kirla Labs / kirla.ai reservierten Bereich 3303-3349
+# (REGISTRY.md §3). NICHT 8080: der steht dort ausdruecklich auf der Freilassliste, und
+# zwar zweifach begruendet -- Altmieter-Port und Code-Vorgabe des mcp-remote-server. Ein
+# Dienst auf 8080 waere laut Registry "ein Rueckfall in den Altzustand".
+Environment=KIRLA_API_ADRESSE=127.0.0.1:3303
 Environment=KIRLA_API_ZIEL=https://openrouter.ai/api/v1
 Environment=KIRLA_API_SCHLUESSEL=/srv/kirla-labs/dev/secrets/kirla-schluessel.json
 Environment=KIRLA_API_HAUPTSCHLUESSEL=/srv/kirla-labs/dev/secrets/openrouter.env

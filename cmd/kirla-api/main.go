@@ -58,7 +58,11 @@ func umgebung(name, vorgabe string) string {
 }
 
 func dienst(protokoll *slog.Logger) error {
-	adresse := umgebung("KIRLA_API_ADRESSE", "127.0.0.1:8080")
+	// 3303 und nicht 8080: auf kirla-01 steht 8080 ausdruecklich auf der Freilassliste
+	// (/etc/kirla/REGISTRY.md §3), 3303-3349 ist der fuer kirla.ai reservierte Bereich.
+	// Die Vorgabe im Quelltext folgt der Unit, damit ein Lauf von Hand nicht auf einem
+	// anderen Port landet als der Dienst.
+	adresse := umgebung("KIRLA_API_ADRESSE", "127.0.0.1:3303")
 	zielRoh := umgebung("KIRLA_API_ZIEL", "https://openrouter.ai/api/v1")
 	schluesselDatei := umgebung("KIRLA_API_SCHLUESSEL", "/srv/kirla-labs/dev/secrets/kirla-schluessel.json")
 	hauptDatei := umgebung("KIRLA_API_HAUPTSCHLUESSEL", "/srv/kirla-labs/dev/secrets/openrouter.env")
