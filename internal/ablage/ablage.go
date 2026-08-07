@@ -8,10 +8,13 @@
 package ablage
 
 import (
+	"bytes"
+	"compress/gzip"
 	"context"
 	_ "embed"
 	"errors"
 	"fmt"
+	"io"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -203,4 +206,103 @@ func nullWennLeer(s string) any {
 		return nil
 	}
 	return s
+}
+
+// ── DIE INHALTE (Auftrag §5, Schritt 4) ────────────────────────────────────────────────
+
+// Inhalt ist der Mitschnitt einer Anfrage samt Antwort. Er verfaellt nach 30 Tagen; die
+// Kopfdaten daneben bleiben dauerhaft.
+type Inhalt struct {
+	AnfrageID string
+	Zeit      time.Time
+	// Beide Felder sind BEREITS gzip-komprimiert, und zwar ueber Klartext.
+	Anfrage  []byte
+	Antwort  []byte
+	KamAls   string // Content-Encoding, mit dem die Antwort ankam (nur Diagnose)
+	Gekuerzt bool
+}
+
+// SchreibeInhalte legt einen Stapel Mitschnitte ab.
+//
+// GETRENNT VON DEN KOPFDATEN, und zwar auch in der Transaktion: geht das Ablegen schief,
+// darf die Abrechnung trotzdem stehen. Ein Mitschnitt ist Diagnose, eine Buchung ist Geld.
+func (a *Ablage) SchreibeInhalte(ctx context.Context, stapel []Inhalt) error {
+	if len(stapel) == 0 {
+		return nil
+	}
+	stapelweise := &pgx.Batch{}
+	for _, i := range stapel {
+		stapelweise.Queue(`
+			INSERT INTO inhalt (anfrage_id, zeit, anfrage, antwort, kam_als, gekuerzt)
+			VALUES ($1,$2,$3,$4,$5,$6)
+			ON CONFLICT (anfrage_id) DO NOTHING`,
+			i.AnfrageID, i.Zeit, i.Anfrage, i.Antwort, nullWennLeer(i.KamAls), i.Gekuerzt)
+	}
+	return a.teich.SendBatch(ctx, stapelweise).Close()
+}
+
+// LiesInhalt holt einen Mitschnitt zurueck -- entpackt, so wie er auf der Leitung stand.
+func (a *Ablage) LiesInhalt(ctx context.Context, anfrageID string) (anfrage, antwort []byte, err error) {
+	var roh1, roh2 []byte
+	err = a.teich.QueryRow(ctx,
+		`SELECT anfrage, antwort FROM inhalt WHERE anfrage_id = $1`, anfrageID).Scan(&roh1, &roh2)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, nil, fmt.Errorf("zu %q liegt kein Mitschnitt (mehr) vor", anfrageID)
+	}
+	if err != nil {
+		return nil, nil, err
+	}
+	if anfrage, err = entpacke(roh1); err != nil {
+		return nil, nil, err
+	}
+	antwort, err = entpacke(roh2)
+	return anfrage, antwort, err
+}
+
+func entpacke(roh []byte) ([]byte, error) {
+	if len(roh) == 0 {
+		return nil, nil
+	}
+	aus, err := gzip.NewReader(bytes.NewReader(roh))
+	if err != nil {
+		return nil, err
+	}
+	defer aus.Close()
+	return io.ReadAll(io.LimitReader(aus, 64<<20))
+}
+
+// Verfall loescht Mitschnitte, die aelter sind als `alter`, und gibt zurueck, wie viele.
+//
+// DIE ZAHL IST DER PUNKT. Der Auftrag §5: "Der Verfall muss laufen, nicht nur eingerichtet
+// sein. Ein Aufraeumer, den niemand prueft, ist in einem halben Jahr ein voller
+// Datentraeger. Schreiben Sie die Zahl der geloeschten Saetze ins Protokoll."
+func (a *Ablage) Verfall(ctx context.Context, alter time.Duration) (int64, error) {
+	marke, err := a.teich.Exec(ctx,
+		`DELETE FROM inhalt WHERE zeit < now() - $1::interval`,
+		fmt.Sprintf("%d seconds", int64(alter.Seconds())))
+	if err != nil {
+		return 0, fmt.Errorf("verfall: %w", err)
+	}
+	return marke.RowsAffected(), nil
+}
+
+// Ablagestand sind die Zahlen, die GET /v1/route ausweist.
+type Ablagestand struct {
+	Saetze    int64
+	Bytes     int64
+	Aeltester time.Time
+}
+
+// Stand misst, was gerade abgelegt ist. Nicht im Anfrageweg -- der Wert wird im
+// Hintergrund aufgefrischt.
+func (a *Ablage) Stand(ctx context.Context) (Ablagestand, error) {
+	var s Ablagestand
+	var aeltester *time.Time
+	err := a.teich.QueryRow(ctx, `
+		SELECT count(*), COALESCE(sum(pg_column_size(anfrage) + pg_column_size(antwort)),0), min(zeit)
+		  FROM inhalt`).Scan(&s.Saetze, &s.Bytes, &aeltester)
+	if aeltester != nil {
+		s.Aeltester = *aeltester
+	}
+	return s, err
 }

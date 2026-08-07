@@ -108,3 +108,6 @@ func (l *Lage) Rest() time.Duration {
 	}
 	return l.fenster - alter
 }
+
+// Fenster gibt die eingestellte Frist -- fuer die Auskunft unter /v1/route.
+func (l *Lage) Fenster() time.Duration { return l.fenster }

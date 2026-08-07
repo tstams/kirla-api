@@ -58,10 +58,22 @@ type Verbrauch struct {
 // Entpackt wird deshalb eine KOPIE, waehrend die Originalbytes unveraendert
 // weiterlaufen. Das ist die einzige Loesung, die beide Zusagen haelt.
 type Mitleser struct {
-	ziel   io.Writer
-	puffer []byte
-	max    int
-	Gesamt int64
+	ziel io.Writer
+
+	// ZWEI PUFFER, ZWEI ZWECKE. Der Kopf ist der Mitschnitt fuer die Ablage (Auftrag §5) --
+	// der Anfang einer Antwort ist das, was ein Mensch bei der Fehlersuche liest. Der
+	// Schwanz ist fuer `usage`, das am ENDE steht. Bei einer gewoehnlichen Antwort von
+	// ~15 KB sind beide dasselbe; erst bei einer langen fallen sie auseinander, und dann
+	// braucht man beides.
+	kopf       []byte
+	schwanz    []byte
+	maxKopf    int
+	maxSchwanz int
+
+	// Gesamt sind die durchgereichten Bytes, gelesen sind die (ggf. entpackten) Bytes,
+	// die in die Puffer gingen.
+	Gesamt  int64
+	gelesen int64
 
 	// Fuer gepackte Antworten: die Kopie laeuft durch eine Roehre in einen Entpacker.
 	rohrEin  *io.PipeWriter
@@ -70,16 +82,25 @@ type Mitleser struct {
 	entpackt bool
 }
 
-// NeuerMitleser schreibt nach ziel und behaelt hoechstens max Bytes vom Ende.
-func NeuerMitleser(ziel io.Writer, max int) *Mitleser {
-	if max <= 0 {
-		max = 256 * 1024
+// NeuerMitleser schreibt nach ziel und behaelt hoechstens maxSchwanz Bytes vom Ende.
+func NeuerMitleser(ziel io.Writer, maxSchwanz int) *Mitleser {
+	if maxSchwanz <= 0 {
+		maxSchwanz = 256 * 1024
 	}
-	return &Mitleser{ziel: ziel, max: max}
+	return &Mitleser{ziel: ziel, maxSchwanz: maxSchwanz}
 }
 
-// Entpacke schaltet das Entpacken des Schwanzes ein. `kodierung` ist der Wert der
-// Kopfzeile Content-Encoding; alles ausser gzip laesst den Mitleser unveraendert.
+// MitMitschnitt schaltet zusaetzlich das Behalten des Anfangs ein -- fuer die Ablage.
+// Ohne diesen Aufruf wird nur der Schwanz behalten und nichts abgelegt.
+func (m *Mitleser) MitMitschnitt(maxKopf int) *Mitleser {
+	if maxKopf > 0 {
+		m.maxKopf = maxKopf
+	}
+	return m
+}
+
+// Entpacke schaltet das Entpacken ein. `kodierung` ist der Wert der Kopfzeile
+// Content-Encoding; alles ausser gzip laesst den Mitleser unveraendert.
 func (m *Mitleser) Entpacke(kodierung string) *Mitleser {
 	if !strings.EqualFold(strings.TrimSpace(kodierung), "gzip") {
 		return m
@@ -90,8 +111,8 @@ func (m *Mitleser) Entpacke(kodierung string) *Mitleser {
 	m.entpackt = true
 	go func() {
 		defer close(m.fertig)
-		// Was hier schiefgeht, kostet nur die Kostenzahl -- der Kunde bekommt seine
-		// Antwort in jedem Fall. Deshalb wird der Rest immer leergelesen.
+		// Was hier schiefgeht, kostet nur die Kostenzahl und den Mitschnitt -- der Kunde
+		// bekommt seine Antwort in jedem Fall. Deshalb wird der Rest immer leergelesen.
 		defer io.Copy(io.Discard, lesen)
 
 		aus, err := gzip.NewReader(lesen)
@@ -116,10 +137,20 @@ func (m *Mitleser) Entpacke(kodierung string) *Mitleser {
 func (m *Mitleser) anhaengen(p []byte) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.puffer = append(m.puffer, p...)
-	if len(m.puffer) > m.max {
-		behalten := m.puffer[len(m.puffer)-m.max:]
-		m.puffer = append(m.puffer[:0], behalten...)
+	m.gelesen += int64(len(p))
+
+	if m.maxKopf > 0 && len(m.kopf) < m.maxKopf {
+		platz := m.maxKopf - len(m.kopf)
+		if platz > len(p) {
+			platz = len(p)
+		}
+		m.kopf = append(m.kopf, p[:platz]...)
+	}
+
+	m.schwanz = append(m.schwanz, p...)
+	if len(m.schwanz) > m.maxSchwanz {
+		behalten := m.schwanz[len(m.schwanz)-m.maxSchwanz:]
+		m.schwanz = append(m.schwanz[:0], behalten...)
 	}
 }
 
@@ -130,8 +161,7 @@ func (m *Mitleser) Write(p []byte) (int, error) {
 	if n > 0 {
 		m.Gesamt += int64(n)
 		if m.entpackt {
-			// Die Kopie geht in den Entpacker; ein Fehler dort beendet nur das
-			// Mitlesen.
+			// Die Kopie geht in den Entpacker; ein Fehler dort beendet nur das Mitlesen.
 			_, _ = m.rohrEin.Write(p[:n])
 		} else {
 			m.anhaengen(p[:n])
@@ -140,16 +170,29 @@ func (m *Mitleser) Write(p []byte) (int, error) {
 	return n, err
 }
 
-// Schwanz gibt die behaltenen Bytes. Bei gepackten Antworten wird zuvor auf den Entpacker
-// gewartet -- sonst laese man einen halb gefuellten Puffer.
-func (m *Mitleser) Schwanz() []byte {
+// schliesse wartet bei gepackten Antworten auf den Entpacker.
+func (m *Mitleser) schliesse() {
 	if m.entpackt {
 		_ = m.rohrEin.Close()
 		<-m.fertig
+		m.entpackt = false
 	}
+}
+
+// Schwanz gibt die behaltenen Bytes vom ENDE -- fuer `usage`.
+func (m *Mitleser) Schwanz() []byte {
+	m.schliesse()
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	return m.puffer
+	return m.schwanz
+}
+
+// Mitschnitt gibt den behaltenen ANFANG und ob dabei gekuerzt wurde.
+func (m *Mitleser) Mitschnitt() (kopf []byte, gekuerzt bool) {
+	m.schliesse()
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.kopf, m.maxKopf > 0 && m.gelesen > int64(m.maxKopf)
 }
 
 // huelle ist der Ausschnitt einer OpenRouter-Antwort, auf den es hier ankommt.

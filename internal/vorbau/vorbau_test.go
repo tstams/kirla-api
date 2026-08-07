@@ -3,6 +3,7 @@ package vorbau
 import (
 	"bufio"
 	"context"
+	"encoding/json"
 	"io"
 	"log/slog"
 	"net/http"
@@ -320,17 +321,23 @@ func TestDerVorbauErfindetKeineInhaltskodierung(t *testing.T) {
 
 // UNSERE EIGENEN PFADE GEHEN NICHT AN OPENROUTER.
 //
-// /v1/route ist die Auskunft ueber die Ablage (Auftrag §5) und kommt mit Schritt 4.
-//
 // /v1/key ist der ernstere Fall und der Grund, warum dieser Test existiert: klabs ruft ihn
 // aus `llm-budget`, um den anbieterseitigen Ausgabendeckel zu pruefen. Durchgereicht saehe
 // OpenRouter den HAUPTSCHLUESSEL und antwortete mit dem Zustand des BETREIBERKONTOS --
 // Verbrauch, Limit und Rest ALLER Kunden zusammen. Der Kunde bekaeme fremde Zahlen zu
 // sehen, und klabs hielte das ganze Betreiberkonto fuer sein eigenes Limit.
+//
+// /v1/route ist die Auskunft ueber die Ablage (Auftrag §5) und gehoert ebenso uns.
 func TestUnserePfadeGehenNichtAnOpenRouter(t *testing.T) {
-	for _, fall := range []struct{ pfad, kennung string }{
-		{"/v1/route", "kirla_route_noch_nicht_da"},
-		{"/v1/key", "kirla_guthaben_noch_nicht_da"},
+	for _, fall := range []struct {
+		pfad   string
+		status int
+	}{
+		// Ohne Toepfe kann /v1/key kein Guthaben ausweisen -- und meldet ausdruecklich
+		// NICHT das Betreiberkonto.
+		{"/v1/key", http.StatusNotImplemented},
+		// /v1/route antwortet immer: die Auskunft haengt an keiner Datenbank.
+		{"/v1/route", http.StatusOK},
 	} {
 		t.Run(fall.pfad, func(t *testing.T) {
 			gefragt := false
@@ -352,19 +359,78 @@ func TestUnserePfadeGehenNichtAnOpenRouter(t *testing.T) {
 			if gefragt {
 				t.Fatalf("%s wurde an OpenRouter weitergereicht", fall.pfad)
 			}
-			if antw.StatusCode != http.StatusNotImplemented {
-				t.Errorf("Status %d statt 501", antw.StatusCode)
-			}
-			if !strings.Contains(string(gelesen), fall.kennung) {
-				t.Errorf("falsche Fehlerkennung: %s", gelesen)
+			if antw.StatusCode != fall.status {
+				t.Errorf("Status %d statt %d: %s", antw.StatusCode, fall.status, gelesen)
 			}
 			// Der Beweis, auf den es ankommt: keine fremde Zahl im Koerper.
-			for _, verraeter := range []string{"842.17", "2000", "1157.83", "betreiberkonto"} {
+			for _, verraeter := range []string{"842.17", "1157.83", "betreiberkonto"} {
 				if strings.Contains(string(gelesen), verraeter) {
 					t.Fatalf("ZAHLEN DES BETREIBERKONTOS SIND DURCHGEDRUNGEN (%q): %s", verraeter, gelesen)
 				}
 			}
 		})
+	}
+}
+
+// OHNE SCHLUESSEL GIBT ES AUCH KEINE AUSKUNFT. Was gespeichert wird, geht Kunden etwas an
+// und Fremde nichts.
+func TestUnserePfadeVerlangenEinenSchluessel(t *testing.T) {
+	vor, _ := bau(t, func(w http.ResponseWriter, r *http.Request) {})
+	for _, pfad := range []string{"/v1/route", "/v1/key"} {
+		r, _ := http.NewRequest(http.MethodGet, vor.URL+pfad, nil)
+		antw, err := http.DefaultClient.Do(r)
+		if err != nil {
+			t.Fatal(err)
+		}
+		antw.Body.Close()
+		if antw.StatusCode != http.StatusUnauthorized {
+			t.Errorf("%s ohne Schluessel: Status %d statt 401", pfad, antw.StatusCode)
+		}
+	}
+}
+
+// DIE AUSKUNFT MUSS DIE UNANGENEHME ZEILE ENTHALTEN (Auftrag §5, klabs ADR-0016).
+//
+// "Die Geschaeftsinhalte aller Kundenfirmen liegen fuer N Tage bei Kirla. Das gehoert in
+// die Nutzungsbedingungen, in `klabs route show` und in die Einrichtung -- nicht in eine
+// Fussnote." Der Test haelt fest, dass die Zahl und das Wort wirklich dastehen.
+func TestDieRouteAuskunftSagtWasGespeichertWirdUndWieLange(t *testing.T) {
+	vor, key := bau(t, func(w http.ResponseWriter, r *http.Request) {})
+	r, _ := http.NewRequest(http.MethodGet, vor.URL+"/v1/route", nil)
+	r.Header.Set("Authorization", "Bearer "+key)
+	antw, err := http.DefaultClient.Do(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer antw.Body.Close()
+
+	var a struct {
+		Kurzfassung string `json:"kurzfassung"`
+		Gespeichert struct {
+			Inhalte struct {
+				Was  string `json:"was"`
+				Tage *int   `json:"tage"`
+			} `json:"inhalte"`
+			Kopfdaten struct {
+				Aufbewahrung string `json:"aufbewahrung"`
+			} `json:"kopfdaten"`
+		} `json:"gespeichert"`
+	}
+	if err := json.NewDecoder(antw.Body).Decode(&a); err != nil {
+		t.Fatalf("die Auskunft ist kein lesbares JSON: %v", err)
+	}
+	if a.Gespeichert.Inhalte.Tage == nil || *a.Gespeichert.Inhalte.Tage != 30 {
+		t.Errorf("die Aufbewahrungsfrist fehlt oder stimmt nicht: %+v", a.Gespeichert.Inhalte.Tage)
+	}
+	if !strings.Contains(a.Gespeichert.Inhalte.Was, "vollstaendig") {
+		t.Errorf("es steht nicht da, dass VOLLSTAENDIG gespeichert wird: %q", a.Gespeichert.Inhalte.Was)
+	}
+	if a.Gespeichert.Kopfdaten.Aufbewahrung != "dauerhaft" {
+		t.Errorf("die Kopfdaten sind nicht als dauerhaft ausgewiesen: %q", a.Gespeichert.Kopfdaten.Aufbewahrung)
+	}
+	// Die Kurzfassung ist das, was ein Mensch liest. Sie muss die Frist nennen.
+	if !strings.Contains(a.Kurzfassung, "30") || !strings.Contains(a.Kurzfassung, "geloescht") {
+		t.Errorf("die Kurzfassung nennt die Frist nicht: %q", a.Kurzfassung)
 	}
 }
 

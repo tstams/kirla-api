@@ -226,3 +226,136 @@ func (a *Abgleicher) Einmal(ctx context.Context) {
 		a.Lage.Gelungen()
 	}
 }
+
+// ── DIE INHALTE (Schritt 4) ────────────────────────────────────────────────────────────
+
+// Inhaltsschreiber leert den Mitschnitt-Kanal in die Datenbank.
+//
+// EIGENER FADEN UND EIGENER KANAL, getrennt von den Kopfdaten. Ein Mitschnitt ist Diagnose,
+// eine Buchung ist Geld: geht das Ablegen schief, darf die Abrechnung trotzdem stehen. Und
+// waehrend eines Datenbankausfalls landen Mitschnitte NICHT im Nachbuch -- eine Datei, die
+// bei einem Tagesausfall auf Gigabytes waechst und keinen Verfall kennt, waere ein zweites
+// Problem statt einer Loesung. Sie gehen dann verloren, und das steht im Protokoll.
+type Inhaltsschreiber struct {
+	Ablage    *Ablage
+	Eingang   <-chan Inhalt
+	Protokoll *slog.Logger
+	Stapel    int
+	Takt      time.Duration
+
+	verloren int
+}
+
+func (s *Inhaltsschreiber) Laufe(ctx context.Context) {
+	if s.Stapel <= 0 {
+		s.Stapel = 16
+	}
+	if s.Takt <= 0 {
+		s.Takt = 3 * time.Second
+	}
+	uhr := time.NewTicker(s.Takt)
+	defer uhr.Stop()
+
+	stapel := make([]Inhalt, 0, s.Stapel)
+	schreibe := func() {
+		if len(stapel) == 0 {
+			return
+		}
+		frist, abbrechen := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+		if err := s.Ablage.SchreibeInhalte(frist, stapel); err != nil {
+			s.verloren += len(stapel)
+			// Gedaempft wie beim Abgleicher: waehrend eines Ausfalls faellt das im Takt an.
+			if s.verloren == len(stapel) || s.verloren%200 < len(stapel) {
+				s.Protokoll.Warn("mitschnitte nicht abgelegt — sie gehen verloren (die abrechnung nicht)",
+					"verloren_gesamt", s.verloren, "fehler", err)
+			}
+		} else if s.verloren > 0 {
+			s.Protokoll.Info("mitschnitte wieder ablegbar", "zuvor_verloren", s.verloren)
+			s.verloren = 0
+		}
+		abbrechen()
+		stapel = stapel[:0]
+	}
+
+	for {
+		select {
+		case i, offen := <-s.Eingang:
+			if !offen {
+				schreibe()
+				return
+			}
+			stapel = append(stapel, i)
+			if len(stapel) >= s.Stapel {
+				schreibe()
+			}
+		case <-uhr.C:
+			schreibe()
+		case <-ctx.Done():
+			schreibe()
+			return
+		}
+	}
+}
+
+// Aufraeumer loescht abgelaufene Mitschnitte -- und schreibt die Zahl ins Protokoll.
+//
+// Auftrag §5: "Der Verfall muss laufen, nicht nur eingerichtet sein. Ein Aufraeumer, den
+// niemand prueft, ist in einem halben Jahr ein voller Datentraeger. Schreiben Sie die Zahl
+// der geloeschten Saetze ins Protokoll."
+//
+// Deshalb steht die Zahl auch dann da, wenn sie null ist: eine Null beweist, dass er lief.
+// Ein Aufraeumer, der schweigt, ist von einem, der nicht laeuft, nicht zu unterscheiden.
+type Aufraeumer struct {
+	Ablage       *Ablage
+	Protokoll    *slog.Logger
+	Aufbewahrung time.Duration
+	Takt         time.Duration
+	// NachDemLauf bekommt den frisch gemessenen Stand -- fuer die Auskunft unter /v1/route.
+	NachDemLauf func(Ablagestand)
+}
+
+func (a *Aufraeumer) Laufe(ctx context.Context) {
+	if a.Takt <= 0 {
+		a.Takt = 6 * time.Hour
+	}
+	if a.Aufbewahrung <= 0 {
+		a.Aufbewahrung = 30 * 24 * time.Hour
+	}
+	uhr := time.NewTicker(a.Takt)
+	defer uhr.Stop()
+	for {
+		select {
+		case <-uhr.C:
+			a.Einmal(ctx)
+		case <-ctx.Done():
+			return
+		}
+	}
+}
+
+// Einmal raeumt einmal auf und misst danach den Bestand.
+func (a *Aufraeumer) Einmal(ctx context.Context) {
+	frist, abbrechen := context.WithTimeout(ctx, 5*time.Minute)
+	defer abbrechen()
+
+	geloescht, err := a.Ablage.Verfall(frist, a.Aufbewahrung)
+	if err != nil {
+		a.Protokoll.Error("verfall gescheitert — die ablage waechst weiter", "fehler", err)
+		return
+	}
+
+	stand, standFehler := a.Ablage.Stand(frist)
+	if standFehler != nil {
+		a.Protokoll.Info("verfall gelaufen", "geloescht", geloescht,
+			"aufbewahrung_tage", int(a.Aufbewahrung.Hours()/24))
+		return
+	}
+	if a.NachDemLauf != nil {
+		a.NachDemLauf(stand)
+	}
+	a.Protokoll.Info("verfall gelaufen",
+		"geloescht", geloescht,
+		"aufbewahrung_tage", int(a.Aufbewahrung.Hours()/24),
+		"bestand_saetze", stand.Saetze,
+		"bestand_mb", stand.Bytes/(1<<20))
+}

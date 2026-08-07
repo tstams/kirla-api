@@ -24,7 +24,7 @@ sie genauso zurück; wer hier normalisiert, bricht die Namensbrücke im Adapter.
 | 1 | Durchreichen + Schlüsselprüfung | **gebaut** |
 | 2 | Kopfdaten buchen, Guthabentöpfe, `402` | **gebaut** |
 | 3 | Kulanzfenster 24 h | **gebaut** |
-| 4 | Ablage 30 Tage komprimiert + `GET /v1/route` | offen |
+| 4 | Ablage 30 Tage komprimiert + `GET /v1/route` | **gebaut** |
 | 5 | Stripe-Aufladung | offen |
 
 ## Bauen und prüfen
@@ -39,7 +39,20 @@ go build ./... && go vet ./... && go test ./...
 kirla-api dienst                 # den Vorbau starten
 kirla-api schluessel neu <name>  # einen Kundenschlüssel vergeben (zeigt ihn EINMAL)
 kirla-api schluessel liste       # vergebene Schlüssel zeigen (ohne Geheimnis)
+kirla-api topf aufladen <kennung> <USD>
+kirla-api mitschnitt <anfrage-id>  # Anfrage und Antwort eines Aufrufs zeigen
+kirla-api verfall                  # abgelaufene Mitschnitte jetzt löschen
 ```
+
+## Was gespeichert wird
+
+**Anfrage und Antwort vollständig, 30 Tage, komprimiert** — darin stehen die Systemtexte,
+der Gesprächsverlauf und die Antworten des Modells jeder Kundenfirma. Danach gelöscht.
+Die **Kopfdaten** daneben (Zeit, Schlüssel, Modell, Tokens, Kosten, Dauer, Status) bleiben
+**dauerhaft**; sie sind Abrechnung und Zeitreihe.
+
+Nachlesbar ist das unter `GET /v1/route` — und genau dafür gibt es den Endpunkt: eine
+Zwischenstelle, deren Umfang man nicht nachlesen kann, ist eine Wette.
 
 Einstellungen über die Umgebung:
 
@@ -49,6 +62,9 @@ Einstellungen über die Umgebung:
 | `KIRLA_API_ZIEL` | `https://openrouter.ai/api/v1` | wohin weitergereicht wird |
 | `KIRLA_API_SCHLUESSEL` | `/srv/kirla-labs/dev/secrets/kirla-schluessel.json` | die vergebenen Kundenschlüssel (nur Hashes) |
 | `KIRLA_API_HAUPTSCHLUESSEL` | `/srv/kirla-labs/dev/secrets/openrouter.env` | der OpenRouter-Hauptschlüssel, Modus 0600 |
+| `KIRLA_API_NACHBUCH` | `/srv/kirla-labs/nachbuch/offen.jsonl` | Abrechnung, die während eines Datenbankausfalls anfällt |
+| `KIRLA_API_KULANZ` | `24h` | wie lange der Vorbau ohne Datenbank weiterreicht |
+| `KIRLA_API_AUFBEWAHRUNG` | `720h` | wie lange die Mitschnitte liegen (30 Tage) |
 
 `SIGHUP` lädt Hauptschlüssel und Schlüsselablage neu, ohne den Dienst anzuhalten — ein
 Schlüsseltausch braucht keinen Neustart.

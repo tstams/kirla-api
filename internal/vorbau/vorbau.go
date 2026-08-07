@@ -64,6 +64,22 @@ type Vorbau struct {
 	// Lage sagt, ob die Datenbank antwortet, wie lange sie schon weg ist und ob das
 	// Kulanzfenster noch traegt (Schritt 3). Ist sie nil, gilt alles als gesund.
 	Lage *kulanz.Lage
+
+	// ── Ablage der Inhalte (Schritt 4, Auftrag §5) ────────────────────────────────────
+	//
+	// EIGENER KANAL, nicht dieselben Saetze wie Buch. Die Kopfdaten sind ~200 Byte und
+	// gehen im Ausfall ins Nachbuch; ein Mitschnitt ist tausendmal so gross und hat dort
+	// nichts verloren -- eine Datei, die bei einem Tagesausfall auf Gigabytes waechst und
+	// keinen Verfall kennt, waere ein zweites Problem statt einer Loesung.
+	Ablagekanal chan<- ablage.Inhalt
+	// Mitschnittgrenze je Richtung; 0 heisst Vorgabe.
+	Mitschnittgrenze int
+	// AufbewahrungTage steht in der Auskunft unter /v1/route; 0 heisst 30.
+	AufbewahrungTage int
+	// Bestand liefert den zuletzt im Hintergrund gemessenen Stand der Ablage. Im
+	// Anfrageweg wird NICHT gezaehlt -- ein count(*) ueber 300 000 Saetze gehoert nicht
+	// in eine Kundenanfrage.
+	Bestand func() Bestandsmessung
 }
 
 // hopfenweise sind die Kopfzeilen, die nur fuer EINE Verbindung gelten und deshalb nicht
@@ -78,14 +94,9 @@ func (v *Vorbau) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	anfrageID := neueAnfrageID()
 	w.Header().Set("X-Kirla-Anfrage-Id", anfrageID)
 
-	// GET /v1/route gehoert UNS und nicht OpenRouter (Auftrag §5). Es wird in Schritt 4
-	// gebaut; bis dahin muss es hier stehen, sonst reichen wir es weiter und der Kunde
-	// bekommt ein 404 von einem fremden Haus, das er nicht kennt.
-	if r.URL.Path == "/v1/route" {
-		v.fehler(w, http.StatusNotImplemented, "kirla_route_noch_nicht_da",
-			"Die Auskunft ueber Speicherung und Aufbewahrung gibt es noch nicht. Bis dahin steht sie in den Nutzungsbedingungen.", anfrageID)
-		return
-	}
+	// GET /v1/route und GET /v1/key gehoeren UNS und nicht OpenRouter. Beantwortet werden
+	// sie weiter unten, HINTER der Schluesselpruefung -- die Auskunft ueber Ablage und
+	// Guthaben geht keinen Fremden etwas an.
 
 	// ── /v1/key DARF NIEMALS DURCHGEREICHT WERDEN ──────────────────────────────────────
 	//
@@ -124,8 +135,12 @@ func (v *Vorbau) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if r.URL.Path == "/v1/key" {
+	switch r.URL.Path {
+	case "/v1/key":
 		v.guthabenAuskunft(w, eintrag, anfrageID)
+		return
+	case "/v1/route":
+		v.routeAuskunft(w, eintrag, anfrageID)
 		return
 	}
 
@@ -201,6 +216,15 @@ func (v *Vorbau) durchreichen(w http.ResponseWriter, r *http.Request, e schluess
 	// Der Anfang des Koerpers wird gelesen, um Modell und max_tokens zu erfahren; danach
 	// laeuft ALLES weiter durch. Gepuffert wird er nicht (Auftrag §3).
 	sicht, koerper := spaehe(r.Body)
+
+	// Die Anfrage wird beim Durchlaufen mitgeschrieben -- gedeckelt, damit der Speicher
+	// nicht an ihrer Laenge haengt. Der TeeReader sitzt HINTER dem Spaehen, damit auch
+	// der bereits gelesene Anfang mitkommt.
+	var anfrageMitschnitt *mitschnittPuffer
+	if v.Ablagekanal != nil && koerper != nil {
+		anfrageMitschnitt = neuerMitschnittPuffer(v.grenze())
+		koerper = io.TeeReader(koerper, anfrageMitschnitt)
+	}
 
 	// ── DAS KULANZFENSTER ENTSCHEIDET, OB UEBERHAUPT ZURUECKGELEGT WIRD ───────────────
 	//
@@ -324,6 +348,9 @@ func (v *Vorbau) durchreichen(w http.ResponseWriter, r *http.Request, e schluess
 			}
 			w.WriteHeader(antw.StatusCode)
 			_, _ = w.Write(roh)
+			v.legeMitschnitt(anfrageID, begonnen, anfrageMitschnitt,
+				kosten.Entpacke(roh, antw.Header.Get("Content-Encoding")), false,
+				antw.Header.Get("Content-Encoding"))
 			v.beende(r, e, anfrageID, begonnen, antw.StatusCode, false, sicht, verbrauch, einkauf, verkauf, quelle)
 			return
 		}
@@ -337,6 +364,9 @@ func (v *Vorbau) durchreichen(w http.ResponseWriter, r *http.Request, e schluess
 	// Der Mitleser reicht jedes Byte unveraendert weiter und behaelt nur den Schwanz,
 	// um daraus `usage` zu lesen.
 	mit := kosten.NeuerMitleser(w, schwanzGrenze).Entpacke(antw.Header.Get("Content-Encoding"))
+	if v.Ablagekanal != nil {
+		mit = mit.MitMitschnitt(v.grenze())
+	}
 	stroeme(w, mit, quelleKoerper)
 
 	// ── ABRECHNEN mit dem, was wirklich angefallen ist (Auftrag §4) ───────────────────
@@ -347,7 +377,39 @@ func (v *Vorbau) durchreichen(w http.ResponseWriter, r *http.Request, e schluess
 		v.bucheAufDenTopf(e.Kennung, quittung, verkauf)
 		abgerechnet = true
 	}
+	if v.Ablagekanal != nil {
+		kopf, gekuerzt := mit.Mitschnitt()
+		v.legeMitschnitt(anfrageID, begonnen, anfrageMitschnitt, kopf, gekuerzt,
+			antw.Header.Get("Content-Encoding"))
+	}
 	v.beende(r, e, anfrageID, begonnen, antw.StatusCode, stroemend, sicht, verbrauch, einkauf, verkauf, quelle)
+}
+
+func (v *Vorbau) grenze() int {
+	if v.Mitschnittgrenze > 0 {
+		return v.Mitschnittgrenze
+	}
+	return VorgabeMitschnittgrenze
+}
+
+// legeMitschnitt fuegt beide Richtungen zusammen und schiebt sie in den Ablagekanal.
+func (v *Vorbau) legeMitschnitt(anfrageID string, zeit time.Time, anfrage *mitschnittPuffer,
+	antwort []byte, antwortGekuerzt bool, kamAls string) {
+
+	if v.Ablagekanal == nil {
+		return
+	}
+	var roh []byte
+	gekuerzt := antwortGekuerzt
+	if anfrage != nil {
+		roh = anfrage.inhalt
+		gekuerzt = gekuerzt || anfrage.gekuerzt()
+	}
+	if len(antwort) > v.grenze() {
+		antwort = antwort[:v.grenze()]
+		gekuerzt = true
+	}
+	v.lege(anfrageID, zeit, roh, antwort, kamAls, gekuerzt)
 }
 
 // bucheAufDenTopf schreibt den Verbrauch in den Topf im Arbeitsspeicher -- auf beiden

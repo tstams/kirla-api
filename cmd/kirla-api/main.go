@@ -9,6 +9,8 @@
 //	kirla-api schluessel oeffnen <kennung>
 //	kirla-api schluessel uebernehmen      Schluessel aus der alten Datei in die Datenbank holen
 //	kirla-api topf aufladen <kennung> <USD>
+//	kirla-api mitschnitt <anfrage-id>     Anfrage und Antwort eines Aufrufs zeigen
+//	kirla-api verfall                     abgelaufene Mitschnitte jetzt loeschen
 package main
 
 import (
@@ -48,7 +50,7 @@ func main() {
 	protokoll := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
 
 	if len(os.Args) < 2 {
-		fmt.Fprintln(os.Stderr, "aufruf: kirla-api dienst | schluessel … | topf aufladen <kennung> <USD>")
+		fmt.Fprintln(os.Stderr, "aufruf: kirla-api dienst | schluessel … | topf aufladen <kennung> <USD> | mitschnitt <id> | verfall")
 		os.Exit(2)
 	}
 
@@ -60,6 +62,10 @@ func main() {
 		err = schluesselVerwalten(os.Args[2:])
 	case "topf":
 		err = topfVerwalten(os.Args[2:])
+	case "mitschnitt":
+		err = mitschnittZeigen(os.Args[2:])
+	case "verfall":
+		err = verfallVonHand(protokoll)
 	default:
 		err = fmt.Errorf("unbekannter befehl %q", os.Args[1])
 	}
@@ -93,6 +99,17 @@ func kulanzFenster() time.Duration {
 		return kulanz.VorgabeFenster
 	}
 	return d
+}
+
+// aufbewahrung liest die Aufbewahrungsfrist der INHALTE. Vorgabe sind die 30 Tage aus
+// Auftrag §5. Die Kopfdaten daneben bleiben dauerhaft und sind davon nicht beruehrt.
+func aufbewahrung() time.Duration {
+	if roh := os.Getenv("KIRLA_API_AUFBEWAHRUNG"); roh != "" {
+		if d, err := time.ParseDuration(roh); err == nil && d > 0 {
+			return d
+		}
+	}
+	return 30 * 24 * time.Hour
 }
 
 func datenbankURL() (string, error) {
@@ -249,17 +266,51 @@ func dienst(protokoll *slog.Logger) error {
 	fertig := make(chan struct{})
 	go func() { schreiber.Laufe(ctx); close(fertig) }()
 
+	// ── DIE ABLAGE DER INHALTE (Schritt 4, Auftrag §5) ───────────────────────────────
+	//
+	// Eigener Kanal, kleiner als der fuer die Kopfdaten: ein Mitschnitt ist komprimiert
+	// ein paar Kilobyte statt 200 Byte. 256 Saetze sind bei 0,14 Anfragen/s (§6) eine
+	// halbe Stunde Vorrat und im Speicher ein paar Megabyte.
+	inhalte := make(chan ablage.Inhalt, 256)
+	inhaltsschreiber := &ablage.Inhaltsschreiber{
+		Ablage: abl, Eingang: inhalte, Protokoll: protokoll, Stapel: 16, Takt: 3 * time.Second,
+	}
+	inhalteFertig := make(chan struct{})
+	go func() { inhaltsschreiber.Laufe(ctx); close(inhalteFertig) }()
+
+	var bestand atomic.Pointer[vorbau.Bestandsmessung]
+	aufraeumer := &ablage.Aufraeumer{
+		Ablage: abl, Protokoll: protokoll,
+		Aufbewahrung: aufbewahrung(), Takt: 6 * time.Hour,
+		NachDemLauf: func(st ablage.Ablagestand) {
+			bestand.Store(&vorbau.Bestandsmessung{Ablagestand: st, Gemessen: time.Now()})
+		},
+	}
+	// EINMAL BEIM START, und nicht erst nach sechs Stunden: ein Dienst, der nach einem
+	// Neustart erstmal einen halben Tag nicht aufraeumt, sammelt bei haeufigen Neustarts
+	// unbegrenzt. Die Zahl steht danach im Protokoll -- auch wenn sie null ist.
+	aufraeumer.Einmal(ctx)
+	go aufraeumer.Laufe(ctx)
+
 	v := &vorbau.Vorbau{
-		Ziel:            ziel,
-		Hauptschluessel: func() string { return *hauptschluessel.Load() },
-		Client:          client,
-		Protokoll:       protokoll,
-		Toepfe:          toepfe,
-		Preise:          tafel,
-		Buch:            buch,
-		Aufschlag:       aufschlag,
-		Boden:           boden,
-		Lage:            lage,
+		Ziel:             ziel,
+		Hauptschluessel:  func() string { return *hauptschluessel.Load() },
+		Client:           client,
+		Protokoll:        protokoll,
+		Toepfe:           toepfe,
+		Preise:           tafel,
+		Buch:             buch,
+		Aufschlag:        aufschlag,
+		Boden:            boden,
+		Lage:             lage,
+		Ablagekanal:      inhalte,
+		AufbewahrungTage: int(aufbewahrung().Hours() / 24),
+		Bestand: func() vorbau.Bestandsmessung {
+			if b := bestand.Load(); b != nil {
+				return *b
+			}
+			return vorbau.Bestandsmessung{}
+		},
 	}
 	// Das Verzeichnis wird vom Abgleicher ausgetauscht; der Vorbau liest es je Anfrage.
 	v.Verzeichnis = verzeichnis.Load()
@@ -313,7 +364,8 @@ func dienst(protokoll *slog.Logger) error {
 		"adresse", adresse, "ziel", ziel.String(),
 		"schluessel", len(v.Verzeichnis.Alle()), "toepfe", len(toepfe.Alle()),
 		"preise", anzahl, "preise_geholt", geholt.Format(time.RFC3339),
-		"aufschlag_prozent", float64(aufschlag)/100, "boden_usd", boden.Text(2))
+		"aufschlag_prozent", float64(aufschlag)/100, "boden_usd", boden.Text(2),
+		"aufbewahrung_tage", int(aufbewahrung().Hours()/24))
 
 	if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		return err
@@ -325,6 +377,12 @@ func dienst(protokoll *slog.Logger) error {
 	case <-fertig:
 	case <-time.After(45 * time.Second):
 		protokoll.Error("der schreiber wurde nicht fertig — abrechnung kann fehlen")
+	}
+	close(inhalte)
+	select {
+	case <-inhalteFertig:
+	case <-time.After(30 * time.Second):
+		protokoll.Warn("der inhaltsschreiber wurde nicht fertig — mitschnitte koennen fehlen")
 	}
 	protokoll.Info("vorbau beendet")
 	return nil
@@ -508,5 +566,44 @@ func topfVerwalten(argumente []string) error {
 	fmt.Printf("%s: %s USD aufgeladen, neues Guthaben %s USD\n",
 		argumente[1], betrag.Text(6), neu.Text(6))
 	fmt.Println("Wirksam im laufenden Dienst nach dem naechsten Abgleich (30 s) oder sofort mit `systemctl reload kirla-api`.")
+	return nil
+}
+
+// mitschnittZeigen holt Anfrage und Antwort eines Aufrufs zurueck.
+//
+// OHNE DIESEN WEG WAERE DIE ABLAGE NUR BALLAST. Der Auftrag §5 begruendet sie damit, dass
+// sich sonst "weder ein Prompt-Fehler noch ein Modellvergleich untersuchen" laesst -- also
+// muss man herankommen, und zwar mit der Anfrage-Id aus der Kopfzeile X-Kirla-Anfrage-Id.
+func mitschnittZeigen(argumente []string) error {
+	if len(argumente) < 1 {
+		return errors.New("aufruf: kirla-api mitschnitt <anfrage-id>")
+	}
+	ctx := context.Background()
+	abl, err := oeffneAblage(ctx)
+	if err != nil {
+		return err
+	}
+	defer abl.Schliesse()
+
+	anfrage, antwort, err := abl.LiesInhalt(ctx, argumente[0])
+	if err != nil {
+		return err
+	}
+	fmt.Printf("── ANFRAGE (%d Byte) ──\n%s\n\n", len(anfrage), anfrage)
+	fmt.Printf("── ANTWORT (%d Byte) ──\n%s\n", len(antwort), antwort)
+	return nil
+}
+
+// verfallVonHand raeumt sofort auf, statt auf den naechsten Takt zu warten.
+func verfallVonHand(protokoll *slog.Logger) error {
+	ctx := context.Background()
+	abl, err := oeffneAblage(ctx)
+	if err != nil {
+		return err
+	}
+	defer abl.Schliesse()
+
+	a := &ablage.Aufraeumer{Ablage: abl, Protokoll: protokoll, Aufbewahrung: aufbewahrung()}
+	a.Einmal(ctx)
 	return nil
 }

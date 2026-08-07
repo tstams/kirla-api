@@ -59,3 +59,36 @@ CREATE INDEX IF NOT EXISTS aufruf_kennung_zeit ON aufruf (kennung, zeit DESC);
 
 -- Fuer die Betreibersicht ueber alle Kunden hinweg.
 CREATE INDEX IF NOT EXISTS aufruf_zeit ON aufruf (zeit DESC);
+
+-- ── DIE INHALTE, GETRENNT UND MIT VERFALL (Auftrag §5, Schritt 4) ──────────────────────
+--
+-- "Getrennt halten: Kopfdaten gehoeren in die Datenbank und duerfen DAUERHAFT bleiben;
+-- sie sind Abrechnung und Zeitreihe. Die Inhalte gehoeren daneben und verfallen."
+--
+-- Genau deshalb eine eigene Tabelle und nicht zwei Spalten mehr in `aufruf`: ein DELETE
+-- auf `inhalt` laesst die Abrechnung unberuehrt, und niemand kann versehentlich die
+-- Zeitreihe mitloeschen.
+--
+-- ABGELEGT WIRD IMMER GZIP UEBER KLARTEXT. Kam die Antwort schon gepackt (Go setzt
+-- `Accept-Encoding: gzip` von selbst), wird sie vorher entpackt. Damit gilt fuer jeden Satz
+-- dieselbe Regel -- `gunzip` und man liest, was auf der Leitung stand. Ein Feld, in dem mal
+-- das eine und mal das andere steht, kostet in einem Jahr mehr als die paar Zyklen jetzt.
+--
+-- Die Rechnung aus §5: ~15 KB je Aufruf, ~10 000 Aufrufe/Tag -> ~150 MB/Tag, 30 Tage
+-- Bestand ~4,5 GB roh, komprimiert ~600 MB. Der Cluster liegt auf einem eigenen
+-- Datentraeger mit 364 GB frei (gemessen 07.08.2026) -- das traegt.
+CREATE TABLE IF NOT EXISTS inhalt (
+    anfrage_id  text        PRIMARY KEY,
+    zeit        timestamptz NOT NULL,
+    anfrage     bytea,
+    antwort     bytea,
+    -- Content-Encoding, mit dem die Antwort ANKAM. Nur zur Diagnose; abgelegt ist sie
+    -- entpackt und neu gepackt.
+    kam_als     text,
+    -- Wurde beim Mitschneiden gekuerzt, weil der Koerper die Grenze ueberschritt?
+    gekuerzt    boolean     NOT NULL DEFAULT false
+);
+
+-- Der Aufraeumer laeuft nach Zeit. Ohne diesen Index waere er ein Tabellenscan ueber
+-- 300 000 Saetze, jeden Tag.
+CREATE INDEX IF NOT EXISTS inhalt_zeit ON inhalt (zeit);
