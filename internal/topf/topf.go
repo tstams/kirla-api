@@ -153,6 +153,29 @@ func (t *Toepfe) Abrechnen(q *Quittung, tatsaechlich geld.Betrag) {
 // Anfrage OpenRouter nie erreicht hat und deshalb nichts gekostet haben kann.
 func (t *Toepfe) Freigeben(q *Quittung) { t.Abrechnen(q, 0) }
 
+// Verbrauche bucht Verbrauch OHNE vorherige Ruecklage.
+//
+// Das ist der Fall im Kulanzfenster: dort wird nicht zurueckgelegt (Auftrag §4), weil die
+// Toepfe veraltet sind und ein 402 auf einen veralteten Stand hin falsch waere. Gebucht
+// wird trotzdem, damit der Stand im Speicher waehrend des Ausfalls MITLAEUFT -- sonst
+// meldet /v1/key stundenlang ein Guthaben, das es nicht mehr gibt, und klabs rechnet mit
+// einem Deckel, der laengst aufgebraucht ist.
+//
+// DER DOPPELABZUG, DEN DAS AUFWIRFT: dasselbe Geld steht danach zweimal da -- hier als
+// `verbraucht` und im Nachbuch als Satz, der bei der Wiederkehr das Guthaben in der
+// Datenbank senkt. Aufgeloest wird das ueber Abgeglichen(), das der Nachbuch-Lauf fuer
+// jeden getragenen Satz ruft. Genau dieselbe Mechanik wie beim gewoehnlichen Schreiber.
+func (t *Toepfe) Verbrauche(kennung string, betrag geld.Betrag) {
+	if betrag <= 0 {
+		return
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if p, da := t.nach[kennung]; da {
+		p.verbraucht += betrag
+	}
+}
+
 // Stand gibt den Zustand eines Topfes.
 func (t *Toepfe) Stand(kennung string) (Stand, bool) {
 	t.mu.Lock()

@@ -103,9 +103,16 @@ func (n *Nachbuch) zaehle() (int, error) {
 // das ON CONFLICT DO NOTHING in SchreibeAufrufe ab -- die Anfrage-Id ist der
 // Primaerschluessel.
 //
-// WAS DABEI NICHT PASSIERT: die Toepfe werden nicht noch einmal belastet. Die Abbuchung
-// steckt in derselben Transaktion wie die Kopfdaten, und die laeuft genau einmal.
-func (n *Nachbuch) Arbeite(ctx context.Context, abl *ablage.Ablage, stapelgroesse int) (int, error) {
+// Die Abbuchung steckt in derselben Transaktion wie die Kopfdaten und laeuft damit in der
+// DATENBANK genau einmal.
+//
+// IM ARBEITSSPEICHER STEHT DERSELBE BETRAG EIN ZWEITES MAL, und das ist Absicht: waehrend
+// des Ausfalls wird der Verbrauch dort mitgefuehrt, damit /v1/key nicht stundenlang ein
+// Guthaben meldet, das es nicht mehr gibt. `nachErfolg` bekommt jeden Stapel, der WIRKLICH
+// in der Datenbank steht -- darueber raeumt der Aufrufer den Betrag aus dem Arbeitsspeicher
+// wieder heraus. Ohne diesen Rueckruf zieht der naechste Abgleich denselben Betrag zweimal
+// ab.
+func (n *Nachbuch) Arbeite(ctx context.Context, abl *ablage.Ablage, stapelgroesse int, nachErfolg func([]ablage.Aufruf)) (int, error) {
 	if stapelgroesse <= 0 {
 		stapelgroesse = 200
 	}
@@ -131,6 +138,9 @@ func (n *Nachbuch) Arbeite(ctx context.Context, abl *ablage.Ablage, stapelgroess
 		}
 		if err := abl.SchreibeAufrufe(ctx, stapel); err != nil {
 			return err
+		}
+		if nachErfolg != nil {
+			nachErfolg(stapel)
 		}
 		getragen += len(stapel)
 		stapel = stapel[:0]

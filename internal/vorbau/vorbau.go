@@ -315,7 +315,7 @@ func (v *Vorbau) durchreichen(w http.ResponseWriter, r *http.Request, e schluess
 			einkauf, quelle := v.einkauf(verbrauch, antw.StatusCode)
 			verkauf := einkauf.MitAufschlag(v.Aufschlag)
 			if v.Toepfe != nil {
-				v.Toepfe.Abrechnen(quittung, verkauf)
+				v.bucheAufDenTopf(e.Kennung, quittung, verkauf)
 				abgerechnet = true
 				if s, da := v.Toepfe.Stand(e.Kennung); da {
 					w.Header().Set("X-Kirla-Guthaben-USD", s.Rest().Text(6))
@@ -344,10 +344,28 @@ func (v *Vorbau) durchreichen(w http.ResponseWriter, r *http.Request, e schluess
 	einkauf, quelle := v.einkauf(verbrauch, antw.StatusCode)
 	verkauf := einkauf.MitAufschlag(v.Aufschlag)
 	if v.Toepfe != nil {
-		v.Toepfe.Abrechnen(quittung, verkauf)
+		v.bucheAufDenTopf(e.Kennung, quittung, verkauf)
 		abgerechnet = true
 	}
 	v.beende(r, e, anfrageID, begonnen, antw.StatusCode, stroemend, sicht, verbrauch, einkauf, verkauf, quelle)
+}
+
+// bucheAufDenTopf schreibt den Verbrauch in den Topf im Arbeitsspeicher -- auf beiden
+// Wegen, mit und ohne vorherige Ruecklage.
+//
+// OHNE QUITTUNG heisst: wir sind im Kulanzfenster, dort wird nicht zurueckgelegt
+// (Auftrag §4). Gebucht wird trotzdem, damit der Stand waehrend des Ausfalls MITLAEUFT.
+// Sonst meldete /v1/key stundenlang ein Guthaben, das es nicht mehr gibt, und klabs liefe
+// autonom gegen einen Deckel, der laengst aufgebraucht ist.
+//
+// Dass dasselbe Geld danach zweimal dasteht -- hier und im Nachbuch --, loest der
+// Nachbuch-Lauf ueber Abgeglichen() wieder auf.
+func (v *Vorbau) bucheAufDenTopf(kennung string, q *topf.Quittung, verkauf geld.Betrag) {
+	if q != nil {
+		v.Toepfe.Abrechnen(q, verkauf)
+		return
+	}
+	v.Toepfe.Verbrauche(kennung, verkauf)
 }
 
 // beende bucht die Kopfdaten und schreibt die Zeile ins Protokoll -- fuer beide Wege

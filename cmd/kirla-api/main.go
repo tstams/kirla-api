@@ -194,7 +194,16 @@ func dienst(protokoll *slog.Logger) error {
 	}
 
 	nachtragen := func(c context.Context) {
-		getragen, err := nb.Arbeite(c, abl, 200)
+		// DER DOPPELTE BESTAND WIRD HIER AUFGELOEST. Waehrend des Ausfalls stand der
+		// Verbrauch im Arbeitsspeicher UND im Nachbuch. Sobald ein Satz in der Datenbank
+		// ist, senkt er dort das Guthaben -- und muss aus `verbraucht` verschwinden,
+		// sonst zieht der naechste Abgleich denselben Betrag ein zweites Mal ab.
+		aufloesen := func(stapel []ablage.Aufruf) {
+			for _, a := range stapel {
+				toepfe.Abgeglichen(a.Kennung, a.Verkauf)
+			}
+		}
+		getragen, err := nb.Arbeite(c, abl, 200, aufloesen)
 		if err != nil {
 			// Waehrend eines Ausfalls faellt das bei JEDEM Takt an -- der Abgleicher
 			// daempft seine eigene Meldung, und diese hier gehoert dazu. Warn statt

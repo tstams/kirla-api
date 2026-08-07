@@ -196,3 +196,61 @@ func TestEineTeurereAntwortDarfInsMinusFuehren(t *testing.T) {
 		t.Error("der ueberzogene Topf traegt weiter Anfragen")
 	}
 }
+
+// DIE DOPPELTE BUCHFUEHRUNG IM KULANZFENSTER (Betreiberentscheidung 07.08.2026).
+//
+// Waehrend eines Datenbankausfalls wird nicht zurueckgelegt (Auftrag §4), der Verbrauch
+// aber sehr wohl mitgefuehrt -- sonst meldet /v1/key stundenlang ein Guthaben, das es
+// nicht mehr gibt, und klabs laeuft autonom gegen einen aufgebrauchten Deckel.
+//
+// Derselbe Betrag steht dann zweimal da: hier im Speicher und im Nachbuch. Dieser Test
+// spielt den ganzen Weg durch und prueft, dass am Ende GENAU EINMAL abgezogen wurde.
+func TestDoppelteBuchfuehrungImFensterZiehtAmEndeNurEinmalAb(t *testing.T) {
+	tp := Neu()
+	tp.Setze("k1", dollar(t, "10"))
+
+	// Ausfall: keine Ruecklage, aber gebucht wird.
+	tp.Verbrauche("k1", dollar(t, "1"))
+	tp.Verbrauche("k1", dollar(t, "0.5"))
+
+	s, _ := tp.Stand("k1")
+	if s.Rest() != dollar(t, "8.5") {
+		t.Fatalf("waehrend des Ausfalls Rest %s statt 8,5 — der Stand laeuft nicht mit", s.Rest())
+	}
+	if s.Zurueckgelegt != 0 {
+		t.Errorf("im Fenster wurde zurueckgelegt: %s", s.Zurueckgelegt)
+	}
+
+	// Wiederkehr: das Nachbuch traegt beide Saetze in die Datenbank, die dort das
+	// Guthaben auf 8,5 senkt -- und meldet jeden getragenen Satz zurueck.
+	tp.Abgeglichen("k1", dollar(t, "1"))
+	tp.Abgeglichen("k1", dollar(t, "0.5"))
+	tp.Setze("k1", dollar(t, "8.5"))
+
+	s, _ = tp.Stand("k1")
+	if s.Rest() != dollar(t, "8.5") {
+		t.Errorf("nach der Wiederkehr Rest %s statt 8,5 — es wurde doppelt abgezogen", s.Rest())
+	}
+	if s.Verbraucht != 0 {
+		t.Errorf("verbraucht steht noch auf %s", s.Verbraucht)
+	}
+}
+
+// OHNE DEN RUECKRUF WAERE ES EIN DOPPELABZUG. Der Test haelt fest, was passiert, wenn
+// jemand `Abgeglichen` beim Nachbuchen vergisst -- damit klar ist, warum es dort steht.
+func TestOhneAbgleichWuerdeDoppeltAbgezogen(t *testing.T) {
+	tp := Neu()
+	tp.Setze("k1", dollar(t, "10"))
+	tp.Verbrauche("k1", dollar(t, "1"))
+
+	// Nachbuch getragen, Datenbank steht auf 9 -- aber niemand hat es dem Speicher gesagt.
+	tp.Setze("k1", dollar(t, "9"))
+
+	s, _ := tp.Stand("k1")
+	if s.Rest() == dollar(t, "9") {
+		t.Fatal("hier waere der Doppelabzug geheilt — dann braucht Abgeglichen() niemand")
+	}
+	if s.Rest() != dollar(t, "8") {
+		t.Errorf("Rest %s — erwartet war der Doppelabzug auf 8", s.Rest())
+	}
+}
