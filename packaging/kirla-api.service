@@ -1,0 +1,66 @@
+[Unit]
+Description=kirla.ai — die Zwischenstelle (OpenAI-Schnittstelle vor OpenRouter)
+Documentation=https://github.com/tstams/kirla-api
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=exec
+# Eigener Dienstbenutzer. Auf dieser Maschine laeuft die klabs-Firma `leuchtfeuer` mit
+# proc.exec — ein Unterprozess dort kann alles lesen, was SEIN Benutzer lesen kann. Der
+# OpenRouter-Hauptschluessel liegt deshalb unter labs und nicht unter leuchtfeuer, und
+# /srv/kirla-labs steht auf 0700.
+User=labs
+Group=labs
+
+ExecStart=/usr/local/bin/kirla-api dienst
+# SIGHUP laedt Hauptschluessel und Schluesselablage neu, ohne den Dienst anzuhalten.
+ExecReload=/bin/kill -HUP $MAINPID
+
+Environment=KIRLA_API_ADRESSE=127.0.0.1:8080
+Environment=KIRLA_API_ZIEL=https://openrouter.ai/api/v1
+Environment=KIRLA_API_SCHLUESSEL=/srv/kirla-labs/dev/secrets/kirla-schluessel.json
+Environment=KIRLA_API_HAUPTSCHLUESSEL=/srv/kirla-labs/dev/secrets/openrouter.env
+
+Restart=always
+RestartSec=2s
+# Der Vorbau haelt laufende Stroeme beim Beenden bis zu 90 s offen: ein Modellaufruf, der
+# bei einem Neustart abbricht, ist bezahlte Arbeit, die niemand bekommt. Die Frist hier
+# muss groesser sein, sonst schlaegt systemd zu, bevor er fertig ist.
+TimeoutStopSec=120s
+KillSignal=SIGTERM
+
+# ── Rechte enger, als sie sein muessten ────────────────────────────────────────────────
+# Schritt 1 liest nur: das Binary, die zwei Schluesseldateien, das Netz. Sobald Schritt 2
+# in eine Datenbank schreibt, kommt hier ein ReadWritePaths dazu -- und nicht eher.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RemoveIPC=yes
+# Der Dienst spricht ausschliesslich TCP nach aussen und lauscht auf localhost.
+RestrictAddressFamilies=AF_INET AF_INET6
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=kirla-api
+
+[Install]
+WantedBy=multi-user.target
