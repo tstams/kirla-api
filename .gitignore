@@ -1,0 +1,7 @@
+# Das gebaute Binary gehoert nicht in git (klabs-Regel: Pakete gehoeren nicht in git).
+/kirla-api
+/build/
+
+# Schluessel gehoeren NIE hierher, sondern nach ~/dev/secrets/ mit Modus 0600.
+*.env
+kirla-schluessel.json
