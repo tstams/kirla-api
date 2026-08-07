@@ -22,7 +22,7 @@ sie genauso zurück; wer hier normalisiert, bricht die Namensbrücke im Adapter.
 | Schritt | Was | Zustand |
 |---|---|---|
 | 1 | Durchreichen + Schlüsselprüfung | **gebaut** |
-| 2 | Kopfdaten buchen, Guthabentöpfe, `402` | offen |
+| 2 | Kopfdaten buchen, Guthabentöpfe, `402` | **gebaut** |
 | 3 | Kulanzfenster 24 h | offen |
 | 4 | Ablage 30 Tage komprimiert + `GET /v1/route` | offen |
 | 5 | Stripe-Aufladung | offen |
@@ -83,3 +83,5 @@ wird nicht repariert.
   eine Kennung, und gehasht wird mit bcrypt
 - [ADR-0002](docs/adr/0002-kosten-koennen-bei-streaming-keine-kopfzeile-sein.md) — die
   Kostenangabe kann bei Streaming keine Kopfzeile sein
+- [ADR-0003](docs/adr/0003-frei-ist-nicht-unbekannt.md) — „kostenlos" und „keine
+  Kostenangabe" sind zwei Fälle, nicht einer

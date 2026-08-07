@@ -193,15 +193,15 @@ func TestZweiKennungenKollidierenNicht(t *testing.T) {
 // TestMain senkt die bcrypt-Kosten fuer die Tests. Im Betrieb gilt der Wert aus dem
 // Quelltext; hier zaehlt, dass die Liste in Sekunden durchlaeuft und nicht in Minuten.
 func TestMain(m *testing.M) {
-	kostenfaktor = bcrypt.MinCost
+	Kostenfaktor = bcrypt.MinCost
 	os.Exit(m.Run())
 }
 
 // BenchmarkPruefungOhneBestaetigung misst, was eine frische Pruefung im Betrieb kostet —
 // die Zahl, an der die Wahl des Kostenfaktors haengt.
 func BenchmarkPruefungOhneBestaetigung(b *testing.B) {
-	kostenfaktor = 12
-	defer func() { kostenfaktor = bcrypt.MinCost }()
+	Kostenfaktor = 12
+	defer func() { Kostenfaktor = bcrypt.MinCost }()
 
 	klartext, e, err := Erzeuge("testfirma")
 	if err != nil {

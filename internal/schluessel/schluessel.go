@@ -69,7 +69,7 @@ func Erzeuge(nutzer string) (klartext string, e Eintrag, err error) {
 	if err != nil {
 		return "", Eintrag{}, err
 	}
-	hash, err := bcrypt.GenerateFromPassword([]byte(geheimnis), kostenfaktor)
+	hash, err := bcrypt.GenerateFromPassword([]byte(geheimnis), Kostenfaktor)
 	if err != nil {
 		return "", Eintrag{}, fmt.Errorf("hash erzeugen: %w", err)
 	}
@@ -95,9 +95,11 @@ func Erzeuge(nutzer string) (klartext string, e Eintrag, err error) {
 // die Abwaegung steht in docs/adr/0001 und ist ohne Neuvergabe von Schluesseln jederzeit
 // umzustellen.
 //
-// Keine Konstante, damit die Tests ihn senken koennen: mit 12 kostet jede Erzeugung eine
-// Viertelsekunde, und eine Testliste wird zur Kaffeepause. Im Betrieb wird er nie gesetzt.
-var kostenfaktor = 12
+// Ausgeschrieben und keine Konstante, damit Tests ihn senken koennen: mit 12 kostet jede
+// Erzeugung eine Viertelsekunde, und unter -race wird eine Testliste zur Kaffeepause. Das
+// Paket liegt unter internal/, ist also keine oeffentliche Schnittstelle. IM BETRIEB WIRD
+// ER NIE GESETZT -- wer das doch tut, senkt die Kosten fuer einen Angreifer.
+var Kostenfaktor = 12
 
 func zufall(zeichen int) (string, error) {
 	// base32 macht aus 5 Bit ein Zeichen; wir brauchen aufgerundet so viele Bytes.
@@ -134,8 +136,8 @@ func Zerlege(klartext string) (kennung, geheimnis string, ok bool) {
 // Betriebsregel des Auftrags (§0): der heisse Weg darf nichts anfassen muessen. Faellt die
 // Quelle aus, altert dieses Verzeichnis einfach — es hoert nicht auf zu antworten.
 type Verzeichnis struct {
-	mu       sync.RWMutex
-	nach     map[string]Eintrag // Kennung -> Eintrag
+	mu         sync.RWMutex
+	nach       map[string]Eintrag // Kennung -> Eintrag
 	bestaetigt map[string]bestaetigung
 }
 
